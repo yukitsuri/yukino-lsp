@@ -23,7 +23,7 @@
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "yukino-lsp";
-            version = "0.1.0";
+            version = "0.1.1";
             src = ./.;
 
             cargoLock = {

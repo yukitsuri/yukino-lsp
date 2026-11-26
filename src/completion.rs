@@ -1,8 +1,10 @@
 use std::path::Path;
 use tower_lsp::lsp_types::{
-    Command, CompletionItem, CompletionItemKind, CompletionResponse, InsertTextFormat, Position,
+    Command, CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit,
+    InsertTextFormat, Position, TextEdit,
 };
 use yukic_ast::{ImportPath, ImportPattern, ItemKind, Module, PathPrefix};
+use yukic_span::BytePos;
 
 use crate::document::Document;
 use crate::workspace::WorkspaceEnv;
@@ -17,6 +19,35 @@ pub fn compute_completions(
     let offset = doc.position_to_byte_offset(pos);
     let prefix = get_prefix_before_offset(&doc.text, offset);
     let current_file = doc.uri.to_file_path().unwrap_or_default();
+
+    // `cload "<cursor>"` / `cload "<cursor>` (and `load "<cursor>`) header path completions
+    if let Some(cload_ctx) = extract_cload_path_context(&doc.text, offset) {
+        let range = doc.span_to_range(
+            BytePos(u32::try_from(cload_ctx.path_start_byte).unwrap_or(0)),
+            BytePos(u32::try_from(offset).unwrap_or(0)),
+        );
+        for rel_path in env.list_header_files(&current_file) {
+            if !cload_ctx.partial.is_empty() && !rel_path.contains(cload_ctx.partial) {
+                continue;
+            }
+            let new_text = if cload_ctx.has_closing_quote {
+                rel_path.clone()
+            } else {
+                format!("{rel_path}\"")
+            };
+            items.push(CompletionItem {
+                label: rel_path.clone(),
+                kind: Some(CompletionItemKind::FILE),
+                detail: Some("C header".to_string()),
+                filter_text: Some(rel_path),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit { range, new_text })),
+                insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
+                ..Default::default()
+            });
+        }
+        return CompletionResponse::Array(items);
+    }
+
     let current_fun = find_enclosing_fun(module, offset, &doc.text);
     let current_class = find_enclosing_class(module, offset, &doc.text);
 
@@ -110,9 +141,9 @@ pub fn compute_completions(
         }
     }
 
-    // scoped calls like: std:: or std::io::
+    // scoped calls like: std:: or std::io:: or header_stem::
     if let Some((segments, partial)) = extract_scoped_path(prefix) {
-        populate_scoped_completions(&mut items, &segments, partial, env, &current_file);
+        populate_scoped_completions(&mut items, &segments, partial, module, env, &current_file);
         return CompletionResponse::Array(items);
     }
 
@@ -162,6 +193,7 @@ pub fn compute_completions(
     populate_attribute_snippets(&mut items);
     populate_in_scope_variables(&mut items, offset, &doc.text, module, current_fun.as_deref(), current_class.as_deref());
     populate_ast_symbols(&mut items, module, prefix, current_fun.as_deref(), current_class.as_deref());
+    populate_cload_symbols(&mut items, module, &current_file, env);
     populate_imported_symbols(&mut items, module, &current_file, env, prefix, current_fun.as_deref(), current_class.as_deref());
     if let Some(parent) = current_file.parent() {
         for cls in crate::workspace::scan_spes_classes(parent) {
@@ -196,7 +228,7 @@ fn is_identifier_naming_position(prefix: &str) -> bool {
 
     // immediately after decl kw
     let decl_keywords = [
-        "fun", "cfun", "class", "struct", "cstruct", "interface", "enum", "type", "define",
+        "fun", "cfun", "class", "struct", "cstruct", "cunion", "cvar", "interface", "enum", "type", "define",
     ];
     if decl_keywords.contains(&last) && prefix.ends_with(' ') {
         return true;
@@ -475,6 +507,9 @@ fn populate_class_rewrite_fields(
     seen: &mut std::collections::HashSet<String>,
 ) {
     for f in &cls.fields {
+        if f.is_static {
+            continue;
+        }
         let this_field = format!("this.{}", f.name.name);
         if seen.insert(this_field.clone()) {
             items.push(CompletionItem {
@@ -671,7 +706,12 @@ fn is_extends_position(prefix: &str) -> bool {
 }
 
 fn is_type_annotation_position(prefix: &str) -> bool {
-    if prefix.contains("load ") || prefix.contains("public load ") {
+    let last_line = prefix.lines().last().unwrap_or(prefix).trim_start();
+    if last_line.starts_with("load ")
+        || last_line.starts_with("public load ")
+        || last_line.starts_with("cload ")
+        || last_line.starts_with("public cload ")
+    {
         return false;
     }
 
@@ -1122,10 +1162,64 @@ fn extract_scoped_path(line_prefix: &str) -> Option<(Vec<&str>, &str)> {
     Some((segments, after_colon.trim()))
 }
 
+struct CloadPathContext<'a> {
+    path_start_byte: usize,
+    partial: &'a str,
+    has_closing_quote: bool,
+}
+
+fn extract_cload_path_context(doc_text: &str, offset: usize) -> Option<CloadPathContext<'_>> {
+    let safe_offset = offset.min(doc_text.len());
+    let line_start = doc_text[..safe_offset].rfind('\n').map_or(0, |i| i + 1);
+    let line_prefix = &doc_text[line_start..safe_offset];
+    let trimmed = line_prefix.trim_start();
+    let leading_ws = line_prefix.len() - trimmed.len();
+
+    let after_kw = if let Some(r) = trimmed.strip_prefix("public cload") {
+        r
+    } else if let Some(r) = trimmed.strip_prefix("cload") {
+        r
+    } else if let Some(r) = trimmed.strip_prefix("public load") {
+        r
+    } else if let Some(r) = trimmed.strip_prefix("load") {
+        r
+    } else {
+        return None;
+    };
+
+    if after_kw.is_empty() || !after_kw.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+
+    let kw_len = trimmed.len() - after_kw.len();
+    let after_ws = after_kw.trim_start();
+    let ws_len = after_kw.len() - after_ws.len();
+    let after_open_quote = after_ws.strip_prefix('"')?;
+    // If there's already another quote before the cursor, cursor is past the string literal.
+    if after_open_quote.contains('"') {
+        return None;
+    }
+
+    let path_start_byte = line_start + leading_ws + kw_len + ws_len + 1;
+    let rest_of_line = doc_text[safe_offset..]
+        .split('\n')
+        .next()
+        .unwrap_or("");
+    let rest_stmt = rest_of_line.split(';').next().unwrap_or("");
+    let has_closing_quote = rest_stmt.contains('"');
+
+    Some(CloadPathContext {
+        path_start_byte,
+        partial: after_open_quote,
+        has_closing_quote,
+    })
+}
+
 fn populate_scoped_completions(
     items: &mut Vec<CompletionItem>,
     segments: &[&str],
     _partial: &str,
+    module: &Module,
     env: &WorkspaceEnv,
     current_file: &Path,
 ) {
@@ -1134,6 +1228,16 @@ fn populate_scoped_completions(
     }
 
     let first = segments[0];
+
+    if segments.len() == 1 {
+        for (_decl, hdr) in env.collect_cload_headers(module, current_file) {
+            if hdr.namespace == first && hdr.error.is_none() {
+                for export in hdr.exports {
+                    push_export_completion(items, export);
+                }
+            }
+        }
+    }
 
     // if typing submodules under a package (e.g. `std::`)
     if segments.len() == 1 {
@@ -1148,42 +1252,47 @@ fn populate_scoped_completions(
         }
     }
 
-    // Tty resolving as a module import path: e.g. `std.io`
+    // Try resolving as a module import path: e.g. `std.io`
     let import_path_str = segments.join(".");
     let dummy_path = parse_import_path_str(&import_path_str);
     if let Some(target_file) = env.resolve_import(&dummy_path, current_file) {
         if let Some(cached) = env.get_or_parse_module(&target_file) {
             for export in cached.exports {
-                let (insert_text, insert_format) = match export.kind.as_str() {
-                    "function" | "cfun" => {
-                        let (snip, fmt) = function_signature_to_snippet(&export.name, &export.signature);
-                        (Some(snip), fmt)
-                    }
-                    "struct" => {
-                        let (snip, fmt) = struct_signature_to_snippet(&export.name, &export.signature);
-                        (Some(snip), fmt)
-                    }
-                    _ => (None, None),
-                };
-                items.push(CompletionItem {
-                    label: export.name,
-                    kind: match export.kind.as_str() {
-                        "function" | "cfun" => Some(CompletionItemKind::FUNCTION),
-                        "struct" => Some(CompletionItemKind::STRUCT),
-                        "class" => Some(CompletionItemKind::CLASS),
-                        "enum" => Some(CompletionItemKind::ENUM),
-                        "interface" => Some(CompletionItemKind::INTERFACE),
-                        _ => Some(CompletionItemKind::VARIABLE),
-                    },
-                    detail: Some(export.signature),
-                    documentation: export.doc.map(tower_lsp::lsp_types::Documentation::String),
-                    insert_text,
-                    insert_text_format: insert_format,
-                    ..Default::default()
-                });
+                push_export_completion(items, export);
             }
         }
     }
+}
+
+fn push_export_completion(items: &mut Vec<CompletionItem>, export: crate::workspace::ExportedSymbol) {
+    let (insert_text, insert_format) = match export.kind.as_str() {
+        "function" | "cfun" => {
+            let (snip, fmt) = function_signature_to_snippet(&export.name, &export.signature);
+            (Some(snip), fmt)
+        }
+        "struct" | "cstruct" | "cunion" => {
+            let (snip, fmt) = struct_signature_to_snippet(&export.name, &export.signature);
+            (Some(snip), fmt)
+        }
+        _ => (None, None),
+    };
+    items.push(CompletionItem {
+        label: export.name,
+        kind: match export.kind.as_str() {
+            "function" | "cfun" => Some(CompletionItemKind::FUNCTION),
+            "struct" | "cstruct" | "cunion" => Some(CompletionItemKind::STRUCT),
+            "class" => Some(CompletionItemKind::CLASS),
+            "enum" => Some(CompletionItemKind::ENUM),
+            "interface" => Some(CompletionItemKind::INTERFACE),
+            "constant" => Some(CompletionItemKind::CONSTANT),
+            _ => Some(CompletionItemKind::VARIABLE),
+        },
+        detail: Some(export.signature),
+        documentation: export.doc.map(tower_lsp::lsp_types::Documentation::String),
+        insert_text,
+        insert_text_format: insert_format,
+        ..Default::default()
+    });
 }
 
 fn extract_dot_receiver(line_prefix: &str) -> Option<(&str, &str)> {
@@ -1287,15 +1396,20 @@ fn infer_receiver_type(receiver: &str, doc_text: &str) -> Option<String> {
 
             let with_eq = format!("{receiver} = ");
             if let Some(rest) = after_decl.strip_prefix(&with_eq) {
-                let token = rest
+                let raw_token = rest
                     .split(|c: char| c == '(' || c.is_whitespace() || c == '{')
                     .next()
                     .unwrap_or("")
                     .trim();
-                if !token.is_empty()
-                    && token.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false)
+                let short_token = raw_token.rsplit("::").next().unwrap_or(raw_token);
+                if !short_token.is_empty()
+                    && short_token
+                        .chars()
+                        .next()
+                        .map(|c| c.is_ascii_uppercase())
+                        .unwrap_or(false)
                 {
-                    return Some(token.to_string());
+                    return Some(short_token.to_string());
                 }
             }
         }
@@ -1398,6 +1512,37 @@ fn populate_instance_dot_completions(
                     return;
                 }
             }
+            if let ItemKind::Cstruct(ref cs) = item.kind {
+                if cs.name.name == *ty_name {
+                    add_cstruct_members(items, cs);
+                    return;
+                }
+            }
+            if let ItemKind::Externc(ref ext) = item.kind {
+                for ei in &ext.items {
+                    if let yukic_ast::ExterncItem::Cstruct(ref cs) = ei {
+                        if cs.name.name == *ty_name {
+                            add_cstruct_members(items, cs);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        for (_decl, hdr) in env.collect_cload_headers(module, current_file) {
+            for hdr_item in &hdr.items {
+                if let ItemKind::Externc(ref ext) = hdr_item.kind {
+                    for ei in &ext.items {
+                        if let yukic_ast::ExterncItem::Cstruct(ref cs) = ei {
+                            if cs.name.name == *ty_name {
+                                add_cstruct_members(items, cs);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         for item in &module.items {
@@ -1482,6 +1627,17 @@ fn add_struct_members(items: &mut Vec<CompletionItem>, s: &yukic_ast::StructDecl
     }
 }
 
+fn add_cstruct_members(items: &mut Vec<CompletionItem>, cs: &yukic_ast::CstructDecl) {
+    for f in &cs.fields {
+        items.push(CompletionItem {
+            label: f.name.name.clone(),
+            kind: Some(CompletionItemKind::FIELD),
+            detail: Some(format!("field {}: {}", f.name.name, f.ty)),
+            ..Default::default()
+        });
+    }
+}
+
 fn add_common_object_methods(items: &mut Vec<CompletionItem>) {
     items.push(CompletionItem {
         label: "len()".to_string(),
@@ -1535,6 +1691,28 @@ fn populate_import_symbols(
                     ..Default::default()
                 });
             }
+        }
+    }
+}
+
+fn populate_cload_symbols(
+    items: &mut Vec<CompletionItem>,
+    module: &Module,
+    current_file: &Path,
+    env: &WorkspaceEnv,
+) {
+    for (_decl, hdr) in env.collect_cload_headers(module, current_file) {
+        if hdr.error.is_some() {
+            continue;
+        }
+        items.push(CompletionItem {
+            label: hdr.namespace.clone(),
+            kind: Some(CompletionItemKind::MODULE),
+            detail: Some(format!("C header namespace ({})", hdr.rel_path)),
+            ..Default::default()
+        });
+        for export in hdr.exports {
+            push_export_completion(items, export);
         }
     }
 }
@@ -1813,10 +1991,15 @@ fn populate_dot_completions(items: &mut Vec<CompletionItem>, module: &Module) {
                 });
             }
             for field in &cls.fields {
+                let kind_label = if field.is_static { "Static field" } else { "Field" };
                 items.push(CompletionItem {
                     label: field.name.name.clone(),
-                    kind: Some(CompletionItemKind::FIELD),
-                    detail: Some(format!("Field in class {}", cls.name.name)),
+                    kind: Some(if field.is_static {
+                        CompletionItemKind::CONSTANT
+                    } else {
+                        CompletionItemKind::FIELD
+                    }),
+                    detail: Some(format!("{kind_label} {}: {} in class {}", field.name.name, field.ty, cls.name.name)),
                     ..Default::default()
                 });
             }
@@ -2283,15 +2466,32 @@ fn populate_ast_symbols(
                             });
                         }
                         yukic_ast::ExterncItem::Cstruct(ref cs) => {
+                            let kw = if cs.is_union { "cunion" } else { "cstruct" };
                             items.push(CompletionItem {
                                 label: cs.name.name.clone(),
                                 kind: Some(CompletionItemKind::STRUCT),
-                                detail: Some(format!("cstruct {}", cs.name.name)),
+                                detail: Some(format!("{kw} {}", cs.name.name)),
+                                ..Default::default()
+                            });
+                        }
+                        yukic_ast::ExterncItem::Cvar(ref cv) => {
+                            items.push(CompletionItem {
+                                label: cv.name.name.clone(),
+                                kind: Some(CompletionItemKind::VARIABLE),
+                                detail: Some(format!("cvar {}: {}", cv.name.name, cv.ty)),
                                 ..Default::default()
                             });
                         }
                     }
                 }
+            }
+            ItemKind::Cvar(ref cv) => {
+                items.push(CompletionItem {
+                    label: cv.name.name.clone(),
+                    kind: Some(CompletionItemKind::VARIABLE),
+                    detail: Some(format!("cvar {}: {}", cv.name.name, cv.ty)),
+                    ..Default::default()
+                });
             }
             _ => {}
         }
@@ -2322,6 +2522,8 @@ fn populate_keywords(items: &mut Vec<CompletionItem>, prefix: &str) {
         ("struct", "struct ${1:Name} {\n    $0\n}", "Declare a value type structure"),
         ("public struct", "public struct ${1:Name} {\n    $0\n}", "Declare a public value type structure"),
         ("cstruct", "cstruct ${1:Name} {\n    $0\n}", "Declare a C-compatible structure"),
+        ("cunion", "cunion ${1:Name} {\n    $0\n}", "Declare a C-compatible union"),
+        ("cvar", "cvar ${1:name}: ${2:c_int};", "Declare an external C global variable"),
         ("interface", "interface ${1:Name} {\n    $0\n}", "Declare an interface contract"),
         ("enum", "enum ${1:Name} {\n    $0\n}", "Declare an enumeration"),
         ("load", "load ${1:module}: ${2:symbol};", "Import module symbols"),
@@ -2354,6 +2556,33 @@ fn populate_keywords(items: &mut Vec<CompletionItem>, prefix: &str) {
     }
 
     items.push(CompletionItem {
+        label: "cload".to_string(),
+        kind: Some(CompletionItemKind::KEYWORD),
+        detail: Some("Load C header (.h)".to_string()),
+        insert_text: Some("cload \"$0\"".to_string()),
+        insert_text_format: Some(InsertTextFormat::SNIPPET),
+        command: Some(Command {
+            title: "triggerSuggest".to_string(),
+            command: "editor.action.triggerSuggest".to_string(),
+            arguments: None,
+        }),
+        ..Default::default()
+    });
+    items.push(CompletionItem {
+        label: "public cload".to_string(),
+        kind: Some(CompletionItemKind::KEYWORD),
+        detail: Some("Load and re-export C header (.h)".to_string()),
+        insert_text: Some("public cload \"$0\"".to_string()),
+        insert_text_format: Some(InsertTextFormat::SNIPPET),
+        command: Some(Command {
+            title: "triggerSuggest".to_string(),
+            command: "editor.action.triggerSuggest".to_string(),
+            arguments: None,
+        }),
+        ..Default::default()
+    });
+
+    items.push(CompletionItem {
         label: "rewrite".to_string(),
         kind: Some(CompletionItemKind::KEYWORD),
         detail: Some("Mutate an existing variable or field".to_string()),
@@ -2383,6 +2612,21 @@ fn populate_types(items: &mut Vec<CompletionItem>) {
         ("bool", "Boolean (true / false)"),
         ("string", "UTF-8 string"),
         ("bytes", "Raw byte buffer"),
+        ("c_char", "C platform char"),
+        ("c_schar", "C signed char"),
+        ("c_uchar", "C unsigned char"),
+        ("c_short", "C signed short"),
+        ("c_ushort", "C unsigned short"),
+        ("c_int", "C signed int"),
+        ("c_uint", "C unsigned int"),
+        ("c_long", "C signed long"),
+        ("c_ulong", "C unsigned long"),
+        ("c_longlong", "C signed long long"),
+        ("c_ulonglong", "C unsigned long long"),
+        ("c_size_t", "C size_t"),
+        ("c_ssize_t", "C ssize_t"),
+        ("c_bool", "C _Bool"),
+        ("c_void", "C void"),
         ("ptr<...>", "ptr<${1:uint8}>"),
     ];
 
@@ -2838,5 +3082,166 @@ mod tests {
         } else {
             panic!("Expected array response");
         }
+    }
+
+    #[test]
+    fn test_cload_snippet_and_header_path_completions() {
+        let root = std::env::temp_dir().join(format!("yukino_lsp_cload_comp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("native/sub")).unwrap();
+        std::fs::create_dir_all(root.join("yuki-work")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("yuki.toml"), "[package]\nname = \"cload_test\"\nversion = \"0.1.0\"\n").unwrap();
+        std::fs::write(root.join("native/api.h"), "int c_add(int a, int b);\n").unwrap();
+        std::fs::write(root.join("native/sub/math.h"), "int sub_mul(int x, int y);\n").unwrap();
+        std::fs::write(root.join("yuki-work/ignored.h"), "int ignored_fn(void);\n").unwrap();
+        std::fs::write(root.join("target/ignored.h"), "int ignored_fn2(void);\n").unwrap();
+
+        let main_path = root.join("src/main.ykn");
+        let uri = tower_lsp::lsp_types::Url::from_file_path(&main_path).unwrap();
+        let env = WorkspaceEnv::for_path(&main_path);
+
+        // 1. Top-level cload keyword snippet inserts cload "$0" and retriggers suggestions.
+        let doc_kw = Document::new(uri.clone(), "cl\n".to_string(), 1);
+        let (mod_kw, _) = crate::diagnostics::analyze_document(&doc_kw, Some(&env));
+        let res_kw = compute_completions(&doc_kw, Position::new(0, 2), &mod_kw, &env);
+        if let CompletionResponse::Array(items) = res_kw {
+            let cload_item = items.iter().find(|i| i.label == "cload").expect("expected cload snippet");
+            assert_eq!(cload_item.insert_text.as_deref(), Some("cload \"$0\""));
+            assert_eq!(
+                cload_item.command.as_ref().map(|c| c.command.as_str()),
+                Some("editor.action.triggerSuggest")
+            );
+        } else {
+            panic!("Expected array response");
+        }
+
+        // 2. cload "{cursor}" (closing quote exists -> must NOT append extra ").
+        let doc_closed = Document::new(uri.clone(), "cload \"\"\n".to_string(), 1);
+        let (mod_closed, _) = crate::diagnostics::analyze_document(&doc_closed, Some(&env));
+        let res_closed = compute_completions(&doc_closed, Position::new(0, 7), &mod_closed, &env);
+        if let CompletionResponse::Array(items) = res_closed {
+            let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+            assert!(labels.contains(&"native/api.h"), "missing native/api.h: {:?}", labels);
+            assert!(labels.contains(&"native/sub/math.h"), "missing native/sub/math.h: {:?}", labels);
+            assert!(!labels.contains(&"yuki-work/ignored.h"), "must ignore yuki-work: {:?}", labels);
+            assert!(!labels.contains(&"target/ignored.h"), "must ignore target: {:?}", labels);
+            let api_item = items.iter().find(|i| i.label == "native/api.h").unwrap();
+            match api_item.text_edit.as_ref().expect("expected text_edit") {
+                CompletionTextEdit::Edit(te) => {
+                    assert_eq!(te.new_text, "native/api.h");
+                }
+                _ => panic!("expected simple TextEdit"),
+            }
+        } else {
+            panic!("Expected array response");
+        }
+
+        // 3. cload "{cursor} (missing closing quote -> must append ").
+        let doc_open = Document::new(uri.clone(), "cload \"\n".to_string(), 1);
+        let (mod_open, _) = crate::diagnostics::analyze_document(&doc_open, Some(&env));
+        let res_open = compute_completions(&doc_open, Position::new(0, 7), &mod_open, &env);
+        if let CompletionResponse::Array(items) = res_open {
+            let api_item = items.iter().find(|i| i.label == "native/api.h").unwrap();
+            match api_item.text_edit.as_ref().expect("expected text_edit") {
+                CompletionTextEdit::Edit(te) => {
+                    assert_eq!(te.new_text, "native/api.h\"");
+                }
+                _ => panic!("expected simple TextEdit"),
+            }
+        } else {
+            panic!("Expected array response");
+        }
+
+        // 4. load "{cursor} and load "{cursor}" trigger .h completions with conditional closing quote.
+        let doc_load_open = Document::new(uri.clone(), "load \"\n".to_string(), 1);
+        let (mod_load_open, _) = crate::diagnostics::analyze_document(&doc_load_open, Some(&env));
+        if let CompletionResponse::Array(items) = compute_completions(&doc_load_open, Position::new(0, 6), &mod_load_open, &env) {
+            let api_item = items.iter().find(|i| i.label == "native/api.h").unwrap();
+            match api_item.text_edit.as_ref().unwrap() {
+                CompletionTextEdit::Edit(te) => assert_eq!(te.new_text, "native/api.h\""),
+                _ => panic!("expected simple TextEdit"),
+            }
+        } else {
+            panic!("Expected array response");
+        }
+
+        // 5. Partial prefix cload "native/sub{cursor}" filters and replaces full relative range.
+        let doc_partial = Document::new(uri, "cload \"native/sub\"\n".to_string(), 1);
+        let (mod_partial, _) = crate::diagnostics::analyze_document(&doc_partial, Some(&env));
+        if let CompletionResponse::Array(items) = compute_completions(&doc_partial, Position::new(0, 17), &mod_partial, &env) {
+            let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+            assert_eq!(labels, vec!["native/sub/math.h"]);
+            match items[0].text_edit.as_ref().unwrap() {
+                CompletionTextEdit::Edit(te) => {
+                    assert_eq!(te.range.start.character, 7);
+                    assert_eq!(te.range.end.character, 17);
+                    assert_eq!(te.new_text, "native/sub/math.h");
+                }
+                _ => panic!("expected simple TextEdit"),
+            }
+        } else {
+            panic!("Expected array response");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_cload_symbol_namespace_and_cstruct_dot_completion() {
+        let root = std::env::temp_dir().join(format!("yukino_lsp_cload_sym_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("native")).unwrap();
+        std::fs::write(root.join("yuki.toml"), "[package]\nname = \"cload_sym\"\nversion = \"0.1.0\"\n").unwrap();
+        std::fs::write(
+            root.join("native/api.h"),
+            "#define API_VERSION 2\ntypedef struct Packet {\n    int id;\n    int tag;\n} Packet;\ntypedef union ValueUnion {\n    int i;\n    double f;\n} ValueUnion;\nextern int global_counter;\nint c_add(int a, int b);\n",
+        )
+        .unwrap();
+
+        let main_path = root.join("src/main.ykn");
+        let uri = tower_lsp::lsp_types::Url::from_file_path(&main_path).unwrap();
+        let env = WorkspaceEnv::for_path(&main_path);
+
+        // Expression completion includes header symbols + header namespace.
+        let text1 = "cload \"native/api.h\"\nfun main() {\n    set x = \n}\n";
+        let doc1 = Document::new(uri.clone(), text1.to_string(), 1);
+        let (mod1, _) = crate::diagnostics::analyze_document(&doc1, Some(&env));
+        if let CompletionResponse::Array(items) = compute_completions(&doc1, Position::new(2, 12), &mod1, &env) {
+            let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+            for expected in ["c_add", "Packet", "ValueUnion", "global_counter", "API_VERSION", "api"] {
+                assert!(labels.contains(&expected), "missing '{expected}' in completions: {:?}", labels);
+            }
+        } else {
+            panic!("Expected array response");
+        }
+
+        // Scoped completion after api::
+        let text2 = "cload \"native/api.h\"\nfun main() {\n    set x = api::\n}\n";
+        let doc2 = Document::new(uri.clone(), text2.to_string(), 1);
+        let (mod2, _) = crate::diagnostics::analyze_document(&doc2, Some(&env));
+        if let CompletionResponse::Array(items) = compute_completions(&doc2, Position::new(2, 17), &mod2, &env) {
+            let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+            assert!(labels.contains(&"c_add"), "api:: should suggest c_add, got: {:?}", labels);
+            assert!(labels.contains(&"Packet"), "api:: should suggest Packet, got: {:?}", labels);
+        } else {
+            panic!("Expected array response");
+        }
+
+        // Dot completion on C struct from cload header
+        let text3 = "cload \"native/api.h\"\nfun main() {\n    set p = Packet { id: 1, tag: 2 }\n    set y = p.\n}\n";
+        let doc3 = Document::new(uri, text3.to_string(), 1);
+        let (mod3, _) = crate::diagnostics::analyze_document(&doc3, Some(&env));
+        if let CompletionResponse::Array(items) = compute_completions(&doc3, Position::new(3, 14), &mod3, &env) {
+            let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+            assert!(labels.contains(&"id"), "p. should suggest 'id', got: {:?}", labels);
+            assert!(labels.contains(&"tag"), "p. should suggest 'tag', got: {:?}", labels);
+        } else {
+            panic!("Expected array response");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

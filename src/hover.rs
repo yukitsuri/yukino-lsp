@@ -11,11 +11,64 @@ pub fn compute_hover(
     env: &WorkspaceEnv,
 ) -> Option<Hover> {
     let offset = doc.position_to_byte_offset(pos);
-    let word = get_word_at_offset(&doc.text, offset)?;
     let current_file = doc.uri.to_file_path().unwrap_or_default();
+
+    // Hovering on a `cload "header.h"` declaration shows resolved path & imported symbols.
+    for item in &module.items {
+        if let ItemKind::Cload(ref cl) = item.kind {
+            if offset >= item.span.start.0 as usize && offset <= item.span.end.0 as usize {
+                let hdr = env.get_or_load_cheader(&cl.path, &current_file);
+                if let Some(ref err) = hdr.error {
+                    return Some(create_markdown_hover(&format!(
+                        "**C Header:** `{}`\n\nError: {err}",
+                        cl.path
+                    )));
+                }
+                let preview: Vec<String> = hdr
+                    .exports
+                    .iter()
+                    .take(15)
+                    .map(|e| format!("- `{}`", e.signature))
+                    .collect();
+                let more = if hdr.exports.len() > 15 {
+                    format!("\n... and {} more symbols", hdr.exports.len() - 15)
+                } else {
+                    String::new()
+                };
+                return Some(create_markdown_hover(&format!(
+                    "**C Header:** `{}` (`{}::`)\nResolved: `{}` ({} symbols)\n\n{}{}",
+                    cl.path,
+                    hdr.namespace,
+                    hdr.header_path.display(),
+                    hdr.exports.len(),
+                    preview.join("\n"),
+                    more
+                )));
+            }
+        }
+    }
+
+    let word = get_word_at_offset(&doc.text, offset)?;
 
     if let Some(doc_str) = get_ast_symbol_doc(word, module) {
         return Some(create_markdown_hover(&doc_str));
+    }
+
+    for (_decl, hdr) in env.collect_cload_headers(module, &current_file) {
+        if word == hdr.namespace {
+            return Some(create_markdown_hover(&format!(
+                "**C Header Namespace** `{}` (from `{}`)\n\n{} symbols exported.",
+                hdr.namespace,
+                hdr.rel_path,
+                hdr.exports.len()
+            )));
+        }
+        if let Some(exp) = hdr.exports.iter().find(|e| e.name == word) {
+            return Some(create_markdown_hover(&format!(
+                "```yukino\n{}\n```\nLoaded from `{}` (`{}::{}`).",
+                exp.signature, hdr.rel_path, hdr.namespace, exp.name
+            )));
+        }
     }
 
     if let Some(doc_str) = get_imported_symbol_doc(word, module, &current_file, env) {
@@ -101,11 +154,14 @@ fn get_ast_symbol_doc(word: &str, module: &Module) -> Option<String> {
                 ));
             }
             ItemKind::Cfun(ref c) if c.name.name == word => {
-                let params: Vec<String> = c
+                let mut params: Vec<String> = c
                     .params
                     .iter()
                     .map(|p| format!("{}: {}", p.name.name, p.ty))
                     .collect();
+                if c.is_variadic {
+                    params.push("...".to_string());
+                }
                 let ret = if let Some(ref rt) = c.return_type {
                     format!(" -> {rt}")
                 } else {
@@ -116,6 +172,12 @@ fn get_ast_symbol_doc(word: &str, module: &Module) -> Option<String> {
                     c.name.name,
                     params.join(", "),
                     ret
+                ));
+            }
+            ItemKind::Cvar(ref cv) if cv.name.name == word => {
+                return Some(format!(
+                    "```yukino\ncvar {}: {};\n```\nExternal C global variable declared in current module.",
+                    cv.name.name, cv.ty
                 ));
             }
             ItemKind::Struct(ref s) if s.name.name == word => {
@@ -134,18 +196,19 @@ fn get_ast_symbol_doc(word: &str, module: &Module) -> Option<String> {
                 ));
             }
             ItemKind::Cstruct(ref cs) if cs.name.name == word => {
+                let kw = if cs.is_union { "cunion" } else { "cstruct" };
                 let fields: Vec<String> = cs
                     .fields
                     .iter()
                     .map(|f| format!("    {}: {}", f.name.name, f.ty))
                     .collect();
                 let body = if fields.is_empty() {
-                    format!("cstruct {} {{}}", cs.name.name)
+                    format!("{kw} {} {{}}", cs.name.name)
                 } else {
-                    format!("cstruct {} {{\n{}\n}}", cs.name.name, fields.join(",\n"))
+                    format!("{kw} {} {{\n{}\n}}", cs.name.name, fields.join(",\n"))
                 };
                 return Some(format!(
-                    "```yukino\n{body}\n```\nC-compatible cstruct declared in current module."
+                    "```yukino\n{body}\n```\nC-compatible {kw} declared in current module."
                 ));
             }
             ItemKind::Class(ref c) if c.name.name == word => {
@@ -219,11 +282,14 @@ fn get_ast_symbol_doc(word: &str, module: &Module) -> Option<String> {
                 for ext_item in &ext.items {
                     match ext_item {
                         yukic_ast::ExterncItem::Cfun(ref c) if c.name.name == word => {
-                            let params: Vec<String> = c
+                            let mut params: Vec<String> = c
                                 .params
                                 .iter()
                                 .map(|p| format!("{}: {}", p.name.name, p.ty))
                                 .collect();
+                            if c.is_variadic {
+                                params.push("...".to_string());
+                            }
                             let ret = if let Some(ref rt) = c.return_type {
                                 format!(" -> {rt}")
                             } else {
@@ -237,18 +303,25 @@ fn get_ast_symbol_doc(word: &str, module: &Module) -> Option<String> {
                             ));
                         }
                         yukic_ast::ExterncItem::Cstruct(ref cs) if cs.name.name == word => {
+                            let kw = if cs.is_union { "cunion" } else { "cstruct" };
                             let fields: Vec<String> = cs
                                 .fields
                                 .iter()
                                 .map(|f| format!("    {}: {}", f.name.name, f.ty))
                                 .collect();
                             let body = if fields.is_empty() {
-                                format!("cstruct {} {{}}", cs.name.name)
+                                format!("{kw} {} {{}}", cs.name.name)
                             } else {
-                                format!("cstruct {} {{\n{}\n}}", cs.name.name, fields.join(",\n"))
+                                format!("{kw} {} {{\n{}\n}}", cs.name.name, fields.join(",\n"))
                             };
                             return Some(format!(
-                                "```yukino\n{body}\n```\nExternal C struct inside externc block."
+                                "```yukino\n{body}\n```\nExternal C aggregate inside externc block."
+                            ));
+                        }
+                        yukic_ast::ExterncItem::Cvar(ref cv) if cv.name.name == word => {
+                            return Some(format!(
+                                "```yukino\ncvar {}: {};\n```\nExternal C global variable inside externc block.",
+                                cv.name.name, cv.ty
                             ));
                         }
                         _ => {}
@@ -402,6 +475,15 @@ pub fn get_keyword_doc(word: &str) -> Option<&'static str> {
         ),
         "cstruct" => Some(
             "```yukino\n|packed, align=\"4\"|\ncstruct PacketHeader {\n    magic: uint16,\n    length: uint32,\n}\n```\nDeclares a C-compatible structure following target platform ABI layout and field alignments.",
+        ),
+        "cunion" => Some(
+            "```yukino\ncunion Reg {\n    as_int: c_int,\n    as_float: float32,\n}\n```\nDeclares a C-compatible union sharing storage across fields (initialize 0 or 1 field).",
+        ),
+        "cvar" => Some(
+            "```yukino\ncvar global_errno: c_int;\n```\nDeclares an external C global variable.",
+        ),
+        "cload" => Some(
+            "```yukino\ncload \"include/api.h\"\n```\nLoads a C `.h` header relative to the project manifest directory and makes symbols available directly and via `<header_stem>::symbol`.",
         ),
         "externc" => Some(
             "```yukino\nexternc \"math.h\" {\n    cfun sin(x: float64) -> float64;\n    cfun cos(x: float64) -> float64;\n}\n```\nGroups external C function (`cfun`) and structure (`cstruct`) declarations.",

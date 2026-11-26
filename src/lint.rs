@@ -194,18 +194,33 @@ fn check_module_blocks(
 ) {
     for item in &module.items {
         match &item.kind {
-            ItemKind::Fun(f) => check_block(&f.body, filter, doc, diags),
+            ItemKind::Fun(f) => {
+                if let Some(ref body) = f.body {
+                    check_block(body, filter, doc, diags);
+                }
+            }
+            ItemKind::Cfun(cf) => {
+                if let Some(ref body) = cf.body {
+                    check_block(body, filter, doc, diags);
+                }
+            }
             ItemKind::Class(c) => {
                 for m in &c.methods {
-                    check_block(&m.body, filter, doc, diags);
+                    if let Some(ref body) = m.body {
+                        check_block(body, filter, doc, diags);
+                    }
                 }
                 for a in &c.accessors {
-                    check_block(&a.body, filter, doc, diags);
+                    if let Some(ref body) = a.body {
+                        check_block(body, filter, doc, diags);
+                    }
                 }
             }
             ItemKind::Struct(s) => {
                 for m in &s.methods {
-                    check_block(&m.body, filter, doc, diags);
+                    if let Some(ref body) = m.body {
+                        check_block(body, filter, doc, diags);
+                    }
                 }
             }
             _ => {}
@@ -317,16 +332,20 @@ fn check_unused_vars_in_block(
     diags: &mut Vec<LspDiagnostic>,
 ) {
     for (i, stmt) in block.stmts.iter().enumerate() {
-        let (bound, is_set) = match &stmt.kind {
-            StmtKind::Set { target, .. } => {
+        let (bound, literal_kind) = match &stmt.kind {
+            StmtKind::Set { target, init, .. } => {
                 let mut ids = Vec::new();
                 collect_bound_idents(target, &mut ids);
-                (ids, true)
+                let lit_info = match target {
+                    BindingTarget::Ident(id) => {
+                        classify_literal_init(init).map(|kind| (id.clone(), kind))
+                    }
+                    _ => None,
+                };
+                (ids, lit_info)
             }
-            StmtKind::Static(s) => {
-                (vec![s.name.clone()], false)
-            }
-            _ => (Vec::new(), false),
+            StmtKind::Static(s) => (vec![s.name.clone()], None),
+            _ => (Vec::new(), None),
         };
 
         if bound.is_empty() {
@@ -334,10 +353,11 @@ fn check_unused_vars_in_block(
         }
 
         let mut subsequent_usages = HashSet::new();
-        let mut subsequent_mutations = HashSet::new();
+        let mut mutated = HashSet::new();
+        let mut method_called = HashSet::new();
         for subsequent in &block.stmts[i + 1..] {
             collect_ident_usages_stmt(subsequent, &mut subsequent_usages);
-            collect_mutated_idents_stmt(subsequent, &mut subsequent_mutations);
+            collect_mutated_idents_stmt(subsequent, &mut mutated, &mut method_called);
         }
 
         for id in bound {
@@ -354,17 +374,83 @@ fn check_unused_vars_in_block(
                     doc,
                     diags,
                 );
-            } else if is_set && !subsequent_mutations.contains(&id.name) {
-                emit_warning(
-                    WarningCode::W0005,
-                    format!("variable '{}' is never modified, consider declaring with 'static'", id.name),
-                    id.span.start,
-                    id.span.end,
-                    filter,
-                    doc,
-                    diags,
-                );
+            } else if let Some((ref set_id, kind)) = literal_kind {
+                if set_id.name == id.name
+                    && !mutated.contains(&id.name)
+                    && (kind == LiteralInitKind::Scalar || !method_called.contains(&id.name))
+                {
+                    emit_warning(
+                        WarningCode::W0005,
+                        format!(
+                            "variable '{}' is initialized with a constant literal and never mutated; consider using 'static' instead of 'set'",
+                            id.name
+                        ),
+                        id.span.start,
+                        id.span.end,
+                        filter,
+                        doc,
+                        diags,
+                    );
+                }
             }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LiteralInitKind {
+    Scalar,
+    Aggregate,
+}
+
+fn classify_literal_init(expr: &Expr) -> Option<LiteralInitKind> {
+    match &expr.kind {
+        ExprKind::Literal(_) => Some(LiteralInitKind::Scalar),
+        ExprKind::Unary(_, inner) => classify_literal_init(inner),
+        ExprKind::Binary(op, l, r) => {
+            use yukic_ast::expr::BinaryOp;
+            if matches!(op, BinaryOp::Range | BinaryOp::RangeInclusive) {
+                return None;
+            }
+            let lk = classify_literal_init(l)?;
+            let rk = classify_literal_init(r)?;
+            if lk == LiteralInitKind::Scalar && rk == LiteralInitKind::Scalar {
+                Some(LiteralInitKind::Scalar)
+            } else {
+                None
+            }
+        }
+        ExprKind::Ternary(c, t, e) => {
+            if classify_literal_init(c)? == LiteralInitKind::Scalar {
+                let tk = classify_literal_init(t)?;
+                let ek = classify_literal_init(e)?;
+                if tk == ek {
+                    Some(tk)
+                } else {
+                    Some(LiteralInitKind::Aggregate)
+                }
+            } else {
+                None
+            }
+        }
+        ExprKind::ArrayInit(items) | ExprKind::TupleInit(items) if !items.is_empty() => {
+            for item in items {
+                classify_literal_init(item)?;
+            }
+            Some(LiteralInitKind::Aggregate)
+        }
+        _ => None,
+    }
+}
+
+fn root_ident_of_expr(mut expr: &Expr) -> Option<&str> {
+    loop {
+        match &expr.kind {
+            ExprKind::Ident(id) => return Some(id.name.as_str()),
+            ExprKind::FieldAccess(base, _)
+            | ExprKind::IndexAccess(base, _)
+            | ExprKind::SliceAccess(base, _, _, _) => expr = base,
+            _ => return None,
         }
     }
 }
@@ -439,23 +525,31 @@ fn collect_ident_usages_item(item: &Item, usages: &mut HashSet<String>) {
     match &item.kind {
         ItemKind::Fun(f) => {
             usages.insert(f.name.name.clone());
-            collect_ident_usages_block(&f.body, usages);
+            if let Some(ref body) = f.body {
+                collect_ident_usages_block(body, usages);
+            }
         }
         ItemKind::Class(c) => {
             usages.insert(c.name.name.clone());
             for m in &c.methods {
                 usages.insert(m.name.name.clone());
-                collect_ident_usages_block(&m.body, usages);
+                if let Some(ref body) = m.body {
+                    collect_ident_usages_block(body, usages);
+                }
             }
             for a in &c.accessors {
-                collect_ident_usages_block(&a.body, usages);
+                if let Some(ref body) = a.body {
+                    collect_ident_usages_block(body, usages);
+                }
             }
         }
         ItemKind::Struct(s) => {
             usages.insert(s.name.name.clone());
             for m in &s.methods {
                 usages.insert(m.name.name.clone());
-                collect_ident_usages_block(&m.body, usages);
+                if let Some(ref body) = m.body {
+                    collect_ident_usages_block(body, usages);
+                }
             }
         }
         ItemKind::Static(s) => {
@@ -514,127 +608,198 @@ fn collect_ident_usages_lvalue(lval: &LValue, usages: &mut HashSet<String>) {
     }
 }
 
-fn collect_mutated_idents_stmt(stmt: &Stmt, mutated: &mut HashSet<String>) {
+fn collect_mutated_idents_stmt(
+    stmt: &Stmt,
+    mutated: &mut HashSet<String>,
+    method_called: &mut HashSet<String>,
+) {
     match &stmt.kind {
         StmtKind::Rewrite { target, value, .. } => {
-            if let LValue::Ident(id) = target {
-                mutated.insert(id.name.clone());
+            match target {
+                LValue::Ident(id) => {
+                    mutated.insert(id.name.clone());
+                }
+                LValue::Field(base, _) => {
+                    if let Some(root) = root_ident_of_expr(base) {
+                        mutated.insert(root.to_string());
+                    }
+                    collect_mutated_idents_expr(base, mutated, method_called);
+                }
+                LValue::Index(base, idx) => {
+                    if let Some(root) = root_ident_of_expr(base) {
+                        mutated.insert(root.to_string());
+                    }
+                    collect_mutated_idents_expr(base, mutated, method_called);
+                    collect_mutated_idents_expr(idx, mutated, method_called);
+                }
             }
-            collect_mutated_idents_expr(value, mutated);
+            collect_mutated_idents_expr(value, mutated, method_called);
         }
         StmtKind::Set { init, .. } => {
-            collect_mutated_idents_expr(init, mutated);
+            collect_mutated_idents_expr(init, mutated, method_called);
         }
-        StmtKind::Expr(e) | StmtKind::Return(Some(e)) => collect_mutated_idents_expr(e, mutated),
+        StmtKind::Static(decl) => {
+            collect_mutated_idents_expr(&decl.init, mutated, method_called);
+        }
+        StmtKind::Expr(e) | StmtKind::Return(Some(e)) => {
+            collect_mutated_idents_expr(e, mutated, method_called);
+        }
         StmtKind::Recur(args) => {
             for a in args {
-                collect_mutated_idents_expr(a, mutated);
+                collect_mutated_idents_expr(a, mutated, method_called);
             }
         }
-        StmtKind::Defer(blk) => collect_mutated_idents_block(blk, mutated),
+        StmtKind::Defer(blk) => collect_mutated_idents_block(blk, mutated, method_called),
         _ => {}
     }
 }
 
-fn collect_mutated_idents_block(block: &Block, mutated: &mut HashSet<String>) {
+fn collect_mutated_idents_block(
+    block: &Block,
+    mutated: &mut HashSet<String>,
+    method_called: &mut HashSet<String>,
+) {
     for stmt in &block.stmts {
-        collect_mutated_idents_stmt(stmt, mutated);
+        collect_mutated_idents_stmt(stmt, mutated, method_called);
     }
 }
 
-fn collect_mutated_idents_expr(expr: &Expr, mutated: &mut HashSet<String>) {
+fn collect_mutated_idents_expr(
+    expr: &Expr,
+    mutated: &mut HashSet<String>,
+    method_called: &mut HashSet<String>,
+) {
     match &expr.kind {
         ExprKind::Ref { mutable: true, expr: inner } => {
-            if let ExprKind::Ident(id) = &inner.kind {
-                mutated.insert(id.name.clone());
+            if let Some(root) = root_ident_of_expr(inner) {
+                mutated.insert(root.to_string());
             }
-            collect_mutated_idents_expr(inner, mutated);
+            collect_mutated_idents_expr(inner, mutated, method_called);
         }
-        ExprKind::Ref { mutable: false, expr: inner } => {
-            collect_mutated_idents_expr(inner, mutated);
+        ExprKind::Ref { mutable: false, expr: inner }
+        | ExprKind::Unary(_, inner)
+        | ExprKind::Spread(inner)
+        | ExprKind::NamedArg(_, inner)
+        | ExprKind::Is(inner, _) => {
+            collect_mutated_idents_expr(inner, mutated, method_called);
+        }
+        ExprKind::PtrOf(id) => {
+            mutated.insert(id.name.clone());
         }
         ExprKind::Call(callee, args) | ExprKind::ClassInit(callee, args) => {
-            collect_mutated_idents_expr(callee, mutated);
+            collect_mutated_idents_expr(callee, mutated, method_called);
             for arg in args {
-                collect_mutated_idents_expr(arg, mutated);
+                collect_mutated_idents_expr(arg, mutated, method_called);
             }
         }
-        ExprKind::MethodCall(obj, method, args) | ExprKind::SafeCall(obj, method, args) => {
-            if method.name == "push"
-                || method.name == "pop"
-                || method.name == "clear"
-                || method.name == "insert"
-                || method.name == "remove"
-                || method.name == "append"
-            {
-                if let ExprKind::Ident(id) = &obj.kind {
-                    mutated.insert(id.name.clone());
-                }
+        ExprKind::MethodCall(obj, _, args)
+        | ExprKind::QualifiedMethodCall(obj, _, _, args)
+        | ExprKind::SafeCall(obj, _, args) => {
+            if let Some(root) = root_ident_of_expr(obj) {
+                method_called.insert(root.to_string());
             }
-            collect_mutated_idents_expr(obj, mutated);
+            collect_mutated_idents_expr(obj, mutated, method_called);
             for arg in args {
-                collect_mutated_idents_expr(arg, mutated);
+                collect_mutated_idents_expr(arg, mutated, method_called);
             }
         }
         ExprKind::StructInit(_, fields) => {
             for f in fields {
-                collect_mutated_idents_expr(&f.value, mutated);
+                collect_mutated_idents_expr(&f.value, mutated, method_called);
             }
         }
-        ExprKind::Binary(_, left, right) => {
-            collect_mutated_idents_expr(left, mutated);
-            collect_mutated_idents_expr(right, mutated);
+        ExprKind::Binary(_, left, right) | ExprKind::Pipe(left, right) => {
+            collect_mutated_idents_expr(left, mutated, method_called);
+            collect_mutated_idents_expr(right, mutated, method_called);
         }
-        ExprKind::Unary(_, op) => {
-            collect_mutated_idents_expr(op, mutated);
+        ExprKind::Ternary(c, t, e) => {
+            collect_mutated_idents_expr(c, mutated, method_called);
+            collect_mutated_idents_expr(t, mutated, method_called);
+            collect_mutated_idents_expr(e, mutated, method_called);
         }
         ExprKind::IndexAccess(arr, idx) => {
-            collect_mutated_idents_expr(arr, mutated);
-            collect_mutated_idents_expr(idx, mutated);
+            collect_mutated_idents_expr(arr, mutated, method_called);
+            collect_mutated_idents_expr(idx, mutated, method_called);
         }
         ExprKind::SliceAccess(arr, s, e, _) => {
-            collect_mutated_idents_expr(arr, mutated);
+            collect_mutated_idents_expr(arr, mutated, method_called);
             if let Some(s) = s {
-                collect_mutated_idents_expr(s, mutated);
+                collect_mutated_idents_expr(s, mutated, method_called);
             }
             if let Some(e) = e {
-                collect_mutated_idents_expr(e, mutated);
+                collect_mutated_idents_expr(e, mutated, method_called);
             }
         }
         ExprKind::FieldAccess(obj, _) => {
-            collect_mutated_idents_expr(obj, mutated);
+            collect_mutated_idents_expr(obj, mutated, method_called);
         }
         ExprKind::ArrayInit(elements) | ExprKind::TupleInit(elements) => {
             for elem in elements {
-                collect_mutated_idents_expr(elem, mutated);
+                collect_mutated_idents_expr(elem, mutated, method_called);
             }
         }
-        ExprKind::Block(blk) | ExprKind::RegionBlock(blk) | ExprKind::Loop { body: blk, .. } => {
-            collect_mutated_idents_block(blk, mutated);
+        ExprKind::MapInit(entries) => {
+            for (k, v) in entries {
+                collect_mutated_idents_expr(k, mutated, method_called);
+                collect_mutated_idents_expr(v, mutated, method_called);
+            }
+        }
+        ExprKind::Block(blk)
+        | ExprKind::RegionBlock(blk)
+        | ExprKind::RegionScopedBlock(_, blk)
+        | ExprKind::Loop { body: blk, .. } => {
+            collect_mutated_idents_block(blk, mutated, method_called);
         }
         ExprKind::If { cond, then_branch, elif_branches, else_branch, .. } => {
-            collect_mutated_idents_expr(cond, mutated);
-            collect_mutated_idents_block(then_branch, mutated);
+            collect_mutated_idents_expr(cond, mutated, method_called);
+            collect_mutated_idents_block(then_branch, mutated, method_called);
             for (c, b) in elif_branches {
-                collect_mutated_idents_expr(c, mutated);
-                collect_mutated_idents_block(b, mutated);
+                collect_mutated_idents_expr(c, mutated, method_called);
+                collect_mutated_idents_block(b, mutated, method_called);
             }
             if let Some(b) = else_branch {
-                collect_mutated_idents_block(b, mutated);
+                collect_mutated_idents_block(b, mutated, method_called);
             }
         }
         ExprKind::While { cond, body, .. } => {
-            collect_mutated_idents_expr(cond, mutated);
-            collect_mutated_idents_block(body, mutated);
+            collect_mutated_idents_expr(cond, mutated, method_called);
+            collect_mutated_idents_block(body, mutated, method_called);
         }
         ExprKind::For { iter, body, .. } => {
-            collect_mutated_idents_expr(iter, mutated);
-            collect_mutated_idents_block(body, mutated);
+            collect_mutated_idents_expr(iter, mutated, method_called);
+            collect_mutated_idents_block(body, mutated, method_called);
         }
         ExprKind::Switch { target, arms, .. } => {
-            collect_mutated_idents_expr(target, mutated);
+            collect_mutated_idents_expr(target, mutated, method_called);
             for arm in arms {
-                collect_mutated_idents_block(&arm.body, mutated);
+                if let Some(g) = &arm.guard {
+                    collect_mutated_idents_expr(g, mutated, method_called);
+                }
+                collect_mutated_idents_block(&arm.body, mutated, method_called);
+            }
+        }
+        ExprKind::Sus { body, catches, finally_branch } => {
+            collect_mutated_idents_block(body, mutated, method_called);
+            for c in catches {
+                collect_mutated_idents_block(&c.body, mutated, method_called);
+            }
+            if let Some(fin) = finally_branch {
+                collect_mutated_idents_block(fin, mutated, method_called);
+            }
+        }
+        ExprKind::Lambda(_, body) => {
+            collect_mutated_idents_expr(body, mutated, method_called);
+        }
+        ExprKind::AnonymousFun(fun) => {
+            if let Some(ref body) = fun.body {
+                collect_mutated_idents_block(body, mutated, method_called);
+            }
+        }
+        ExprKind::InterpolatedString(parts) => {
+            for part in parts {
+                if let yukic_ast::expr::StringPart::Expr(e) = part {
+                    collect_mutated_idents_expr(e, mutated, method_called);
+                }
             }
         }
         _ => {}
@@ -643,8 +808,13 @@ fn collect_mutated_idents_expr(expr: &Expr, mutated: &mut HashSet<String>) {
 
 fn collect_ident_usages_expr(expr: &Expr, usages: &mut HashSet<String>) {
     match &expr.kind {
-        ExprKind::Ident(id) => {
+        ExprKind::Ident(id) | ExprKind::PtrOf(id) => {
             usages.insert(id.name.clone());
+        }
+        ExprKind::Path(ids) => {
+            for id in ids {
+                usages.insert(id.name.clone());
+            }
         }
         ExprKind::FieldAccess(obj, _) => {
             collect_ident_usages_expr(obj, usages);
@@ -662,7 +832,9 @@ fn collect_ident_usages_expr(expr: &Expr, usages: &mut HashSet<String>) {
                 collect_ident_usages_expr(e, usages);
             }
         }
-        ExprKind::MethodCall(obj, _, args) | ExprKind::SafeCall(obj, _, args) => {
+        ExprKind::MethodCall(obj, _, args)
+        | ExprKind::QualifiedMethodCall(obj, _, _, args)
+        | ExprKind::SafeCall(obj, _, args) => {
             collect_ident_usages_expr(obj, usages);
             for a in args {
                 collect_ident_usages_expr(a, usages);
@@ -680,17 +852,26 @@ fn collect_ident_usages_expr(expr: &Expr, usages: &mut HashSet<String>) {
                 collect_ident_usages_expr(&f.value, usages);
             }
         }
-        ExprKind::Binary(_, left, right) => {
+        ExprKind::Binary(_, left, right) | ExprKind::Pipe(left, right) => {
             collect_ident_usages_expr(left, usages);
             collect_ident_usages_expr(right, usages);
         }
-        ExprKind::Unary(_, op) => {
+        ExprKind::Ternary(c, t, e) => {
+            collect_ident_usages_expr(c, usages);
+            collect_ident_usages_expr(t, usages);
+            collect_ident_usages_expr(e, usages);
+        }
+        ExprKind::Unary(_, op) | ExprKind::Spread(op) | ExprKind::NamedArg(_, op) => {
             collect_ident_usages_expr(op, usages);
         }
-        ExprKind::Ref { expr: inner, .. } => {
+        ExprKind::Is(inner, _) | ExprKind::Ref { expr: inner, .. } => {
             collect_ident_usages_expr(inner, usages);
         }
         ExprKind::Block(blk) | ExprKind::RegionBlock(blk) | ExprKind::Loop { body: blk, .. } => {
+            collect_ident_usages_block(blk, usages);
+        }
+        ExprKind::RegionScopedBlock(arg, blk) => {
+            collect_ident_usages_expr(arg, usages);
             collect_ident_usages_block(blk, usages);
         }
         ExprKind::If { cond, then_branch, elif_branches, else_branch, .. } => {
@@ -715,12 +896,21 @@ fn collect_ident_usages_expr(expr: &Expr, usages: &mut HashSet<String>) {
         ExprKind::Switch { target, arms, .. } => {
             collect_ident_usages_expr(target, usages);
             for arm in arms {
+                if let Some(g) = &arm.guard {
+                    collect_ident_usages_expr(g, usages);
+                }
                 collect_ident_usages_block(&arm.body, usages);
             }
         }
         ExprKind::ArrayInit(elements) | ExprKind::TupleInit(elements) => {
             for elem in elements {
                 collect_ident_usages_expr(elem, usages);
+            }
+        }
+        ExprKind::MapInit(entries) => {
+            for (k, v) in entries {
+                collect_ident_usages_expr(k, usages);
+                collect_ident_usages_expr(v, usages);
             }
         }
         ExprKind::Sus { body, catches, finally_branch } => {
@@ -733,6 +923,22 @@ fn collect_ident_usages_expr(expr: &Expr, usages: &mut HashSet<String>) {
             }
             if let Some(fin) = finally_branch {
                 collect_ident_usages_block(fin, usages);
+            }
+        }
+        ExprKind::Lambda(_, body) => {
+            collect_ident_usages_expr(body, usages);
+        }
+        ExprKind::AnonymousFun(fun) => {
+            usages.insert(fun.name.name.clone());
+            if let Some(ref body) = fun.body {
+                collect_ident_usages_block(body, usages);
+            }
+        }
+        ExprKind::InterpolatedString(parts) => {
+            for part in parts {
+                if let yukic_ast::expr::StringPart::Expr(sub) = part {
+                    collect_ident_usages_expr(sub, usages);
+                }
             }
         }
         _ => {}

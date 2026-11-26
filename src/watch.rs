@@ -37,7 +37,7 @@ pub fn run_watch(path: &Path, delay_ms: u64, json_mode: bool) {
 
 fn get_file_mtimes(path: &Path, mtimes: &mut HashMap<PathBuf, SystemTime>, explicit_yuki_work: bool) {
     if path.is_file() {
-        if path.extension().is_some_and(|ext| ext == "ykn") {
+        if path.extension().is_some_and(|ext| ext == "ykn" || ext == "ykni") {
             if let Ok(meta) = fs::metadata(path) {
                 if let Ok(mtime) = meta.modified() {
                     mtimes.insert(path.to_path_buf(), mtime);
@@ -59,7 +59,7 @@ fn get_file_mtimes(path: &Path, mtimes: &mut HashMap<PathBuf, SystemTime>, expli
                     continue;
                 }
                 get_file_mtimes(&p, mtimes, explicit_yuki_work);
-            } else if p.extension().is_some_and(|ext| ext == "ykn") {
+            } else if p.extension().is_some_and(|ext| ext == "ykn" || ext == "ykni") {
                 if let Ok(meta) = fs::metadata(&p) {
                     if let Ok(mtime) = meta.modified() {
                         mtimes.insert(p, mtime);

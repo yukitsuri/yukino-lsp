@@ -94,11 +94,14 @@ fn collect_local_symbols(module: &Module, path: &Path) -> Vec<ContextSymbol> {
                 });
             }
             ItemKind::Cfun(ref c) => {
-                let params: Vec<String> = c
+                let mut params: Vec<String> = c
                     .params
                     .iter()
                     .map(|p| format!("{}: {}", p.name.name, p.ty))
                     .collect();
+                if c.is_variadic {
+                    params.push("...".to_string());
+                }
                 let ret = if let Some(ref rt) = c.return_type {
                     format!(" -> {rt}")
                 } else {
@@ -108,6 +111,14 @@ fn collect_local_symbols(module: &Module, path: &Path) -> Vec<ContextSymbol> {
                     name: c.name.name.clone(),
                     kind: "cfun".to_string(),
                     signature: format!("cfun {}({}){};", c.name.name, params.join(", "), ret),
+                    source_file: path_str.clone(),
+                });
+            }
+            ItemKind::Cvar(ref cv) => {
+                symbols.push(ContextSymbol {
+                    name: cv.name.name.clone(),
+                    kind: "cvar".to_string(),
+                    signature: format!("cvar {}: {};", cv.name.name, cv.ty),
                     source_file: path_str.clone(),
                 });
             }
@@ -130,19 +141,20 @@ fn collect_local_symbols(module: &Module, path: &Path) -> Vec<ContextSymbol> {
                 });
             }
             ItemKind::Cstruct(ref cs) => {
+                let kw = if cs.is_union { "cunion" } else { "cstruct" };
                 let fields: Vec<String> = cs
                     .fields
                     .iter()
                     .map(|f| format!("{}: {}", f.name.name, f.ty))
                     .collect();
                 let signature = if fields.is_empty() {
-                    format!("cstruct {}", cs.name.name)
+                    format!("{kw} {}", cs.name.name)
                 } else {
-                    format!("cstruct {} {{ {} }}", cs.name.name, fields.join(", "))
+                    format!("{kw} {} {{ {} }}", cs.name.name, fields.join(", "))
                 };
                 symbols.push(ContextSymbol {
                     name: cs.name.name.clone(),
-                    kind: "cstruct".to_string(),
+                    kind: kw.to_string(),
                     signature,
                     source_file: path_str.clone(),
                 });
@@ -233,11 +245,14 @@ fn collect_local_symbols(module: &Module, path: &Path) -> Vec<ContextSymbol> {
                 for ext_item in &ext.items {
                     match ext_item {
                         yukic_ast::ExterncItem::Cfun(ref c) => {
-                            let params: Vec<String> = c
+                            let mut params: Vec<String> = c
                                 .params
                                 .iter()
                                 .map(|p| format!("{}: {}", p.name.name, p.ty))
                                 .collect();
+                            if c.is_variadic {
+                                params.push("...".to_string());
+                            }
                             let ret = if let Some(ref rt) = c.return_type {
                                 format!(" -> {rt}")
                             } else {
@@ -256,20 +271,29 @@ fn collect_local_symbols(module: &Module, path: &Path) -> Vec<ContextSymbol> {
                             });
                         }
                         yukic_ast::ExterncItem::Cstruct(ref cs) => {
+                            let kw = if cs.is_union { "cunion" } else { "cstruct" };
                             let fields: Vec<String> = cs
                                 .fields
                                 .iter()
                                 .map(|f| format!("{}: {}", f.name.name, f.ty))
                                 .collect();
                             let signature = if fields.is_empty() {
-                                format!("cstruct {}", cs.name.name)
+                                format!("{kw} {}", cs.name.name)
                             } else {
-                                format!("cstruct {} {{ {} }}", cs.name.name, fields.join(", "))
+                                format!("{kw} {} {{ {} }}", cs.name.name, fields.join(", "))
                             };
                             symbols.push(ContextSymbol {
                                 name: cs.name.name.clone(),
-                                kind: "cstruct".to_string(),
+                                kind: kw.to_string(),
                                 signature,
+                                source_file: path_str.clone(),
+                            });
+                        }
+                        yukic_ast::ExterncItem::Cvar(ref cv) => {
+                            symbols.push(ContextSymbol {
+                                name: cv.name.name.clone(),
+                                kind: "cvar".to_string(),
+                                signature: format!("cvar {}: {};", cv.name.name, cv.ty),
                                 source_file: path_str.clone(),
                             });
                         }
@@ -288,6 +312,20 @@ fn collect_imported_symbols(
     env: &WorkspaceEnv,
 ) -> Vec<ContextSymbol> {
     let mut symbols = Vec::new();
+
+    for (_decl, hdr) in env.collect_cload_headers(module, current_file) {
+        if hdr.error.is_none() {
+            let hdr_path = hdr.header_path.to_string_lossy().to_string();
+            for exp in hdr.exports {
+                symbols.push(ContextSymbol {
+                    name: exp.name,
+                    kind: exp.kind,
+                    signature: exp.signature,
+                    source_file: hdr_path.clone(),
+                });
+            }
+        }
+    }
 
     for item in &module.items {
         if let ItemKind::Import(ref imp) = item.kind {

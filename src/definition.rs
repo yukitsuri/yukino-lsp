@@ -11,8 +11,28 @@ pub fn compute_definition(
     env: &WorkspaceEnv,
 ) -> Option<GotoDefinitionResponse> {
     let offset = doc.position_to_byte_offset(pos);
-    let word = get_word_at_offset(&doc.text, offset)?;
     let current_file = doc.uri.to_file_path().unwrap_or_default();
+
+    for item in &module.items {
+        if let ItemKind::Cload(ref cl) = item.kind {
+            if offset >= item.span.start.0 as usize && offset <= item.span.end.0 as usize {
+                let hdr = env.get_or_load_cheader(&cl.path, &current_file);
+                if hdr.header_path.is_file() {
+                    if let Ok(uri) = Url::from_file_path(&hdr.header_path) {
+                        return Some(GotoDefinitionResponse::Scalar(Location {
+                            uri,
+                            range: tower_lsp::lsp_types::Range::new(
+                                Position::new(0, 0),
+                                Position::new(0, 0),
+                            ),
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    let word = get_word_at_offset(&doc.text, offset)?;
 
     for item in &module.items {
         match &item.kind {
@@ -24,6 +44,13 @@ pub fn compute_definition(
                 }));
             }
             ItemKind::Cfun(ref c) if c.name.name == word => {
+                let range = doc.span_to_range(item.span.start, item.span.end);
+                return Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: doc.uri.clone(),
+                    range,
+                }));
+            }
+            ItemKind::Cvar(ref cv) if cv.name.name == word => {
                 let range = doc.span_to_range(item.span.start, item.span.end);
                 return Some(GotoDefinitionResponse::Scalar(Location {
                     uri: doc.uri.clone(),
@@ -177,11 +204,32 @@ pub fn compute_definition(
                                 range,
                             }));
                         }
+                        ExterncItem::Cvar(ref cv) if cv.name.name == word => {
+                            let range = doc.span_to_range(cv.span.start, cv.span.end);
+                            return Some(GotoDefinitionResponse::Scalar(Location {
+                                uri: doc.uri.clone(),
+                                range,
+                            }));
+                        }
                         _ => {}
                     }
                 }
             }
             _ => {}
+        }
+    }
+
+    for (_decl, hdr) in env.collect_cload_headers(module, &current_file) {
+        if let Some((hdr_file, line)) = hdr.symbol_locations.get(word) {
+            if let Ok(uri) = Url::from_file_path(hdr_file) {
+                return Some(GotoDefinitionResponse::Scalar(Location {
+                    uri,
+                    range: tower_lsp::lsp_types::Range::new(
+                        Position::new(*line, 0),
+                        Position::new(*line, 0),
+                    ),
+                }));
+            }
         }
     }
 

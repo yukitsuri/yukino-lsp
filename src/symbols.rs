@@ -98,8 +98,8 @@ pub fn compute_document_symbols(doc: &Document, module: &Module) -> Option<Docum
                     #[allow(deprecated)]
                     members.push(DocumentSymbol {
                         name: f.name.name.clone(),
-                        detail: None,
-                        kind: SymbolKind::FIELD,
+                        detail: if f.is_static { Some("static".to_string()) } else { None },
+                        kind: if f.is_static { SymbolKind::CONSTANT } else { SymbolKind::FIELD },
                         tags: None,
                         deprecated: None,
                         range: f_range,
@@ -137,6 +137,8 @@ pub fn compute_document_symbols(doc: &Document, module: &Module) -> Option<Docum
             }
             ItemKind::Interface(ref i) => (i.name.name.clone(), SymbolKind::INTERFACE, None),
             ItemKind::Static(ref s) => (s.name.name.clone(), SymbolKind::CONSTANT, None),
+            ItemKind::Cvar(ref cv) => (cv.name.name.clone(), SymbolKind::VARIABLE, None),
+            ItemKind::Cload(ref cl) => (format!("cload \"{}\"", cl.path), SymbolKind::FILE, None),
             ItemKind::Macro(ref m) => (m.name.name.clone(), SymbolKind::FUNCTION, None),
             ItemKind::TypeAlias(ref ta) => (ta.name.name.clone(), SymbolKind::TYPE_PARAMETER, None),
             ItemKind::Alias(ref a) => (a.alias.name.clone(), SymbolKind::NAMESPACE, None),
@@ -172,6 +174,20 @@ pub fn compute_document_symbols(doc: &Document, module: &Module) -> Option<Docum
                                 children: None,
                             });
                         }
+                        ExterncItem::Cvar(ref cv) => {
+                            let cv_range = doc.span_to_range(cv.span.start, cv.span.end);
+                            #[allow(deprecated)]
+                            members.push(DocumentSymbol {
+                                name: cv.name.name.clone(),
+                                detail: None,
+                                kind: SymbolKind::VARIABLE,
+                                tags: None,
+                                deprecated: None,
+                                range: cv_range,
+                                selection_range: cv_range,
+                                children: None,
+                            });
+                        }
                     }
                 }
                 (
@@ -182,6 +198,25 @@ pub fn compute_document_symbols(doc: &Document, module: &Module) -> Option<Docum
                     SymbolKind::NAMESPACE,
                     Some(members),
                 )
+            }
+            ItemKind::Namespace(ref ns) => {
+                let ns_name = ns
+                    .path
+                    .iter()
+                    .map(|id| id.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let sub_mod = Module {
+                    file_id: module.file_id,
+                    module_attrs: Vec::new(),
+                    items: ns.items.clone(),
+                    c_namespaces: Default::default(),
+                };
+                let sub_children = match compute_document_symbols(doc, &sub_mod) {
+                    Some(DocumentSymbolResponse::Nested(list)) => Some(list),
+                    _ => None,
+                };
+                (ns_name, SymbolKind::NAMESPACE, sub_children)
             }
             _ => continue,
         };

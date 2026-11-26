@@ -13,10 +13,11 @@ pub fn compute_signature_help(
     env: &WorkspaceEnv,
 ) -> Option<SignatureHelp> {
     let offset = doc.position_to_byte_offset(pos);
-    let (fn_name, active_param) = find_call_context(&doc.text, offset)?;
+    let (raw_fn_name, active_param) = find_call_context(&doc.text, offset)?;
+    let fn_name = raw_fn_name.rsplit("::").next().unwrap_or(raw_fn_name);
     let current_file = doc.uri.to_file_path().unwrap_or_default();
 
-    // Check local module functions and methods
+    // Check local module functions, cfuns, externc blocks, and methods
     for item in &module.items {
         match &item.kind {
             ItemKind::Fun(ref f) if f.name.name == fn_name => {
@@ -40,6 +41,18 @@ pub fn compute_signature_help(
                     active_signature: Some(0),
                     active_parameter: Some(active_param),
                 });
+            }
+            ItemKind::Cfun(ref c) if c.name.name == fn_name => {
+                return Some(cfun_signature_help(c, active_param));
+            }
+            ItemKind::Externc(ref ext) => {
+                for ei in &ext.items {
+                    if let yukic_ast::ExterncItem::Cfun(ref c) = ei {
+                        if c.name.name == fn_name {
+                            return Some(cfun_signature_help(c, active_param));
+                        }
+                    }
+                }
             }
             ItemKind::Class(ref c) => {
                 for m in &c.methods {
@@ -68,6 +81,33 @@ pub fn compute_signature_help(
                 }
             }
             _ => {}
+        }
+    }
+
+    // Check cload C headers
+    for (_decl, hdr) in env.collect_cload_headers(module, &current_file) {
+        if let Some(ns_prefix) = raw_fn_name.strip_suffix(&format!("::{fn_name}")) {
+            if ns_prefix != hdr.namespace {
+                continue;
+            }
+        }
+        for export in &hdr.exports {
+            if export.name == fn_name && export.kind == "cfun" {
+                let params = parse_signature_parameters(&export.signature);
+                return Some(SignatureHelp {
+                    signatures: vec![SignatureInformation {
+                        label: export.signature.clone(),
+                        documentation: Some(tower_lsp::lsp_types::Documentation::String(format!(
+                            "C function from `{}`",
+                            hdr.rel_path
+                        ))),
+                        parameters: Some(params),
+                        active_parameter: Some(active_param),
+                    }],
+                    active_signature: Some(0),
+                    active_parameter: Some(active_param),
+                });
+            }
         }
     }
 
@@ -166,16 +206,50 @@ fn find_call_context(text: &str, offset: usize) -> Option<(&str, u32)> {
     let paren_pos = open_paren_idx?;
     let before_paren = &prefix[..paren_pos].trim_end();
     let fn_start = before_paren
-        .rfind(|c: char| !c.is_alphanumeric() && c != '_')
+        .rfind(|c: char| !c.is_alphanumeric() && c != '_' && c != ':')
         .map(|idx| idx + 1)
         .unwrap_or(0);
 
-    let fn_name = &before_paren[fn_start..];
+    let fn_name = before_paren[fn_start..].trim_matches(':');
     if fn_name.is_empty() {
         return None;
     }
 
     Some((fn_name, comma_count))
+}
+
+fn cfun_signature_help(c: &yukic_ast::CfunDecl, active_param: u32) -> SignatureHelp {
+    let mut labels: Vec<String> = c
+        .params
+        .iter()
+        .map(|p| format!("{}: {}", p.name.name, p.ty))
+        .collect();
+    if c.is_variadic {
+        labels.push("...".to_string());
+    }
+    let params = labels
+        .iter()
+        .map(|l| ParameterInformation {
+            label: ParameterLabel::Simple(l.clone()),
+            documentation: None,
+        })
+        .collect();
+    let ret = if let Some(ref rt) = c.return_type {
+        format!(" -> {rt}")
+    } else {
+        " -> void".to_string()
+    };
+    let sig = format!("cfun {}({}){};", c.name.name, labels.join(", "), ret);
+    SignatureHelp {
+        signatures: vec![SignatureInformation {
+            label: sig,
+            documentation: None,
+            parameters: Some(params),
+            active_parameter: Some(active_param),
+        }],
+        active_signature: Some(0),
+        active_parameter: Some(active_param),
+    }
 }
 
 fn format_fun_signature(name: &str, params: &[yukic_ast::Param], ret: Option<&yukic_ast::TypeNode>) -> String {

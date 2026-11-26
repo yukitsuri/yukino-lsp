@@ -1,6 +1,6 @@
 [package]
 name = "yukino-lsp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Yukitsuri <shareui@proton.me>"]
 license = "MIT"
@@ -17,13 +17,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Yukino compiler crates
-yukic-span = { git = "https://github.com/yukitsuri/yukino", package = "yukic-span" }
-yukic-diagnostics = { git = "https://github.com/yukitsuri/yukino", package = "yukic-diagnostics" }
-yukic-lexer = { git = "https://github.com/yukitsuri/yukino", package = "yukic-lexer" }
-yukic-ast = { git = "https://github.com/yukitsuri/yukino", package = "yukic-ast" }
-yukic-parser = { git = "https://github.com/yukitsuri/yukino", package = "yukic-parser" }
-yukic-resolve = { git = "https://github.com/yukitsuri/yukino", package = "yukic-resolve" }
-yukino-builtin = { git = "https://github.com/yukitsuri/yukino", package = "yukino-builtin" }
+yukic-span = { git = "https://github.com/yukitsuri/yukino", tag = "0.1.1", package = "yukic-span" }
+yukic-diagnostics = { git = "https://github.com/yukitsuri/yukino", tag = "0.1.1", package = "yukic-diagnostics" }
+yukic-lexer = { git = "https://github.com/yukitsuri/yukino", tag = "0.1.1", package = "yukic-lexer" }
+yukic-ast = { git = "https://github.com/yukitsuri/yukino", tag = "0.1.1", package = "yukic-ast" }
+yukic-parser = { git = "https://github.com/yukitsuri/yukino", tag = "0.1.1", package = "yukic-parser" }
+yukic-resolve = { git = "https://github.com/yukitsuri/yukino", tag = "0.1.1", package = "yukic-resolve" }
+yukic-target = { git = "https://github.com/yukitsuri/yukino", tag = "0.1.1", package = "yukic-target" }
+yukic-cheader = { git = "https://github.com/yukitsuri/yukino", tag = "0.1.1", package = "yukic-cheader" }
+yukino-builtin = { git = "https://github.com/yukitsuri/yukino", tag = "0.1.1", package = "yukino-builtin" }
 
 [profile.release]
 opt-level = 3

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -6,11 +6,12 @@ use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 use serde::Deserialize;
-use yukic_ast::{ImportPath, ItemKind, Module, Visibility};
+use yukic_ast::{CloadDecl, ImportPath, Item, ItemKind, Module, Visibility};
 use yukic_lexer::Lexer;
 use yukic_parser::Parser;
 use yukic_resolve::{find_module_file_for_path, SearchPaths};
-use yukic_span::FileId;
+use yukic_span::{FileId, Span};
+use yukic_target::TargetTriple;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[allow(dead_code)]
@@ -89,6 +90,14 @@ pub struct DependencySpec {
     pub reexport: Option<bool>,
     #[serde(default)]
     pub splitnames: Option<bool>,
+    #[serde(default)]
+    pub interface: Option<PathBuf>,
+    #[serde(default)]
+    pub prebuilt: Option<PathBuf>,
+    #[serde(default)]
+    pub archive: Option<PathBuf>,
+    #[serde(default)]
+    pub shared: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -139,14 +148,30 @@ pub struct CachedModule {
     pub exports: Vec<ExportedSymbol>,
 }
 
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct CachedCHeader {
+    pub header_path: PathBuf,
+    pub rel_path: String,
+    pub namespace: String,
+    pub mtime: SystemTime,
+    pub items: Vec<Item>,
+    pub symbols: BTreeSet<String>,
+    pub exports: Vec<ExportedSymbol>,
+    pub symbol_locations: HashMap<String, (PathBuf, u32)>,
+    pub error: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct WorkspaceEnv {
     pub project_root: PathBuf,
     pub search_paths: SearchPaths,
     pub available_libs: Vec<String>,
     pub splitnames: HashMap<String, Vec<String>>,
+    pub prebuilt_interfaces: HashMap<String, PathBuf>,
     pub allow_undef: HashSet<String>,
     cache: Arc<RwLock<HashMap<PathBuf, CachedModule>>>,
+    header_cache: Arc<RwLock<HashMap<PathBuf, CachedCHeader>>>,
 }
 
 impl WorkspaceEnv {
@@ -171,6 +196,7 @@ impl WorkspaceEnv {
         let mut search_paths = SearchPaths::new();
         let mut available_libs = Vec::new();
         let mut splitnames: HashMap<String, Vec<String>> = HashMap::new();
+        let mut prebuilt_interfaces: HashMap<String, PathBuf> = HashMap::new();
 
         let includes = manifest_type.includes();
         if includes.iter().any(|i| i == "stdlib") {
@@ -192,6 +218,7 @@ impl WorkspaceEnv {
             &mut search_paths,
             &mut available_libs,
             &mut splitnames,
+            &mut prebuilt_interfaces,
         );
 
         available_libs.sort();
@@ -225,9 +252,117 @@ impl WorkspaceEnv {
             search_paths,
             available_libs,
             splitnames,
+            prebuilt_interfaces,
             allow_undef,
             cache: Arc::new(RwLock::new(HashMap::new())),
+            header_cache: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    pub fn manifest_dir_for(&self, file_path: &Path) -> PathBuf {
+        let norm_file = file_path.canonicalize().unwrap_or_else(|_| file_path.to_path_buf());
+        let norm_root = self
+            .project_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.project_root.clone());
+        if norm_file.starts_with(&norm_root) || file_path.as_os_str().is_empty() {
+            return self.project_root.clone();
+        }
+        let (dir, _) = find_project_root_and_manifest(file_path);
+        dir
+    }
+
+    pub fn list_header_files(&self, current_file: &Path) -> Vec<String> {
+        let base = self.manifest_dir_for(current_file);
+        let mut out = Vec::new();
+        collect_header_files_recursive(&base, &base, &mut out);
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    pub fn get_or_load_cheader(&self, rel_path: &str, owner_file: &Path) -> CachedCHeader {
+        let manifest_dir = self.manifest_dir_for(owner_file);
+        let resolved = if Path::new(rel_path).is_absolute() {
+            PathBuf::from(rel_path)
+        } else {
+            manifest_dir.join(rel_path)
+        };
+        let cache_key = resolved
+            .canonicalize()
+            .unwrap_or_else(|_| resolved.clone());
+        let mtime = fs::metadata(&resolved)
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+
+        if let Ok(lock) = self.header_cache.read() {
+            if let Some(cached) = lock.get(&cache_key) {
+                if cached.mtime == mtime {
+                    return cached.clone();
+                }
+            }
+        }
+
+        let pp_cfg = load_cheader_preproc_config(&manifest_dir);
+        let namespace = yukic_cheader::header_namespace_for_path(rel_path);
+        let result = match yukic_cheader::load_header_from_manifest(
+            &manifest_dir,
+            rel_path,
+            Visibility::Public,
+            Span::DUMMY,
+            &pp_cfg,
+        ) {
+            Ok(loaded) => {
+                let mut exports = Vec::new();
+                for item in &loaded.items {
+                    collect_item_exports(item, &cache_key, &mut exports, Visibility::Public);
+                }
+                let symbol_locations =
+                    index_c_symbol_lines(&loaded.tracked_files, &loaded.symbols);
+                CachedCHeader {
+                    header_path: cache_key.clone(),
+                    rel_path: rel_path.to_string(),
+                    namespace: loaded.namespace,
+                    mtime,
+                    items: loaded.items,
+                    symbols: loaded.symbols,
+                    exports,
+                    symbol_locations,
+                    error: None,
+                }
+            }
+            Err(err) => CachedCHeader {
+                header_path: resolved,
+                rel_path: rel_path.to_string(),
+                namespace,
+                mtime,
+                items: Vec::new(),
+                symbols: BTreeSet::new(),
+                exports: Vec::new(),
+                symbol_locations: HashMap::new(),
+                error: Some(err.to_string()),
+            },
+        };
+
+        if let Ok(mut lock) = self.header_cache.write() {
+            lock.insert(cache_key, result.clone());
+        }
+        result
+    }
+
+    pub fn collect_cload_headers(
+        &self,
+        module: &Module,
+        current_file: &Path,
+    ) -> Vec<(CloadDecl, CachedCHeader)> {
+        let mut out = Vec::new();
+        for item in &module.items {
+            if let ItemKind::Cload(ref decl) = item.kind {
+                let hdr = self.get_or_load_cheader(&decl.path, current_file);
+                out.push((decl.clone(), hdr));
+            }
+        }
+        out
     }
 
     pub fn resolve_lib_entry_file(&self, pkg_name: &str) -> Option<PathBuf> {
@@ -313,6 +448,31 @@ impl WorkspaceEnv {
                     return Some(p);
                 }
             }
+            let target_name = if import_path.segments.is_empty() {
+                id.name.clone()
+            } else {
+                let segs: Vec<&str> = import_path
+                    .segments
+                    .iter()
+                    .filter_map(|s| match &s.pattern {
+                        yukic_ast::ImportPattern::Exact(n) => Some(n.name.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if segs.is_empty() {
+                    id.name.clone()
+                } else {
+                    format!("{}.{}", id.name, segs.join("."))
+                }
+            };
+            if let Some(p) = self
+                .prebuilt_interfaces
+                .get(&target_name)
+                .or_else(|| self.prebuilt_interfaces.get(&format!("{target_name}.lib")))
+                .or_else(|| self.prebuilt_interfaces.get(&format!("{target_name}.mod")))
+            {
+                return Some(p.clone());
+            }
         }
 
         None
@@ -339,11 +499,19 @@ impl WorkspaceEnv {
         let lexer = Lexer::new(FileId(0), &content);
         let (tokens, _) = lexer.tokenize();
         let mut parser = Parser::with_file_id(tokens, FileId(0));
-        let (module, _) = parser.parse_module();
+        let is_ykni = path.extension().and_then(|s| s.to_str()) == Some("ykni");
+        let (mut module, _) = if is_ykni {
+            parser.parse_interface_module()
+        } else {
+            parser.parse_module()
+        };
+        if is_ykni {
+            flatten_ykni_namespaces(&mut module.items);
+        }
 
         let mut exports = extract_exports(&module, &content, path);
 
-        // Follow public re-exports (e.g. `public load .io: *` in std/lib.ykn)
+        // Follow public re-exports (e.g. `public load .io: *` in std/lib.ykn, or `public cload`)
         if depth < 5 {
             for item in &module.items {
                 if item.visibility == Visibility::Public {
@@ -366,6 +534,13 @@ impl WorkspaceEnv {
                                         }
                                     }
                                 }
+                            }
+                        }
+                    } else if let ItemKind::Cload(ref cl) = item.kind {
+                        let hdr = self.get_or_load_cheader(&cl.path, path);
+                        for exp in hdr.exports {
+                            if !exports.iter().any(|e| e.name == exp.name) {
+                                exports.push(exp);
                             }
                         }
                     }
@@ -411,6 +586,17 @@ impl WorkspaceEnv {
 
     pub fn list_package_submodules(&self, pkg_name: &str) -> Vec<String> {
         let mut submodules = Vec::new();
+        let prefix = format!("{pkg_name}.");
+        for ns in self.prebuilt_interfaces.keys() {
+            if let Some(rest) = ns.strip_prefix(&prefix) {
+                if let Some(first_seg) = rest.split('.').next() {
+                    if !first_seg.is_empty() && first_seg != "lib" && first_seg != "mod" {
+                        submodules.push(first_seg.to_string());
+                    }
+                }
+            }
+        }
+
         let parts: Vec<&str> = pkg_name.split('.').collect();
         let first = parts[0];
         let base_dir = match self.search_paths.find_lib(first) {
@@ -422,7 +608,11 @@ impl WorkspaceEnv {
                     dir.to_path_buf()
                 }
             }
-            None => return submodules,
+            None => {
+                submodules.sort();
+                submodules.dedup();
+                return submodules;
+            }
         };
 
         let mut target_dir = base_dir;
@@ -653,6 +843,7 @@ fn load_dependencies(
     search_paths: &mut SearchPaths,
     available_libs: &mut Vec<String>,
     splitnames: &mut HashMap<String, Vec<String>>,
+    prebuilt_interfaces: &mut HashMap<String, PathBuf>,
 ) {
     let local_deps_dir = project_root.join("yuki-work/local/deps");
     if local_deps_dir.is_dir() {
@@ -718,9 +909,16 @@ fn load_dependencies(
     let mut visited: HashSet<(String, PathBuf)> = HashSet::new();
 
     while let Some((alias, spec, base_dir)) = queue.pop_front() {
+        let has_prebuilt_field = spec.interface.is_some()
+            || spec.prebuilt.is_some()
+            || spec.archive.is_some()
+            || spec.shared.is_some();
+
         let raw_target_dir = if let Some(ref path) = spec.path {
             let direct = base_dir.join(path);
             direct.canonicalize().unwrap_or(direct)
+        } else if has_prebuilt_field {
+            base_dir.clone()
         } else {
             let local_dep_path = project_root.join("yuki-work/local/deps").join(&alias);
             let legacy_dep_path = project_root.join("yuki-work/deps").join(&alias);
@@ -732,6 +930,48 @@ fn load_dependencies(
                 continue;
             }
         };
+
+        let explicit_iface = spec
+            .interface
+            .as_ref()
+            .or(spec.prebuilt.as_ref())
+            .and_then(|raw| {
+                let c1 = raw_target_dir.join(raw);
+                let c2 = base_dir.join(raw);
+                let resolved = if c1.exists() { c1 } else { c2 };
+                if resolved.is_file() {
+                    Some(resolved)
+                } else if resolved.is_dir() {
+                    let named = resolved.join(format!("{alias}.ykni"));
+                    if named.is_file() {
+                        Some(named)
+                    } else {
+                        fs::read_dir(&resolved).ok().and_then(|es| {
+                            es.flatten()
+                                .map(|e| e.path())
+                                .find(|p| p.is_file() && p.extension().is_some_and(|e| e == "ykni"))
+                        })
+                    }
+                } else {
+                    None
+                }
+            });
+
+        let auto_iface = if explicit_iface.is_none()
+            && !raw_target_dir.join("lib.toml").is_file()
+            && !raw_target_dir.join("yuki.toml").is_file()
+        {
+            let named = raw_target_dir.join(format!("{alias}.ykni"));
+            named.is_file().then_some(named)
+        } else {
+            None
+        };
+
+        if let Some(iface_path) = explicit_iface.or(auto_iface) {
+            available_libs.push(alias.clone());
+            register_ykni_namespaces(&alias, &iface_path, prebuilt_interfaces);
+            continue;
+        }
 
         let target_dir = if raw_target_dir.join("yukispace.toml").is_file() {
             if let Ok(text) = fs::read_to_string(raw_target_dir.join("yukispace.toml")) {
@@ -806,6 +1046,73 @@ fn load_dependencies(
                             target_list.push(n);
                             changed = true;
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn flatten_ykni_namespaces(items: &mut Vec<Item>) {
+    let mut flat = Vec::new();
+    for item in items.drain(..) {
+        match item.kind {
+            ItemKind::Namespace(ns) => flat.extend(ns.items),
+            _ => flat.push(item),
+        }
+    }
+    *items = flat;
+}
+
+fn register_ykni_namespaces(
+    alias: &str,
+    ykni_path: &Path,
+    prebuilt_interfaces: &mut HashMap<String, PathBuf>,
+) {
+    prebuilt_interfaces
+        .entry(alias.to_string())
+        .or_insert_with(|| ykni_path.to_path_buf());
+    let Ok(text) = fs::read_to_string(ykni_path) else {
+        return;
+    };
+    let lexer = Lexer::new(FileId(0), &text);
+    let (tokens, _) = lexer.tokenize();
+    let mut parser = Parser::with_file_id(tokens, FileId(0));
+    let (module, _) = parser.parse_interface_module();
+    let mut orig_pkg: Option<String> = None;
+    for attr in &module.module_attrs {
+        if attr.is("ykni::package") {
+            if let yukic_ast::AttributeArgs::Named(pairs) = &attr.args {
+                for (k, v) in pairs {
+                    if k.name == "name" {
+                        if let yukic_ast::ExprKind::Literal(yukic_ast::LiteralValue::String(s)) = &v.kind {
+                            orig_pkg = Some(s.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for item in &module.items {
+        if let ItemKind::Namespace(ref ns) = item.kind {
+            let full_ns = ns
+                .path
+                .iter()
+                .map(|id| id.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            if !full_ns.is_empty() {
+                prebuilt_interfaces
+                    .entry(full_ns.clone())
+                    .or_insert_with(|| ykni_path.to_path_buf());
+                if let Some(ref pkg) = orig_pkg {
+                    if full_ns == *pkg || full_ns == format!("{pkg}.lib") {
+                        prebuilt_interfaces.insert(alias.to_string(), ykni_path.to_path_buf());
+                    } else if let Some(rest) = full_ns.strip_prefix(&format!("{pkg}.")) {
+                        prebuilt_interfaces.insert(
+                            format!("{alias}.{rest}"),
+                            ykni_path.to_path_buf(),
+                        );
                     }
                 }
             }
@@ -925,13 +1232,128 @@ fn read_package_name_from_dir(path: &Path) -> Option<String> {
 
 fn extract_exports(module: &Module, _source: &str, file_path: &Path) -> Vec<ExportedSymbol> {
     let mut exports = Vec::new();
-
     for item in &module.items {
         if item.visibility != Visibility::Public {
             continue;
         }
+        collect_item_exports(item, file_path, &mut exports, item.visibility);
+    }
+    exports
+}
 
-        match &item.kind {
+fn collect_header_files_recursive(root: &Path, dir: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if p.is_dir() {
+            if matches!(name, "yuki-work" | "target" | ".git" | "node_modules") {
+                continue;
+            }
+            collect_header_files_recursive(root, &p, out);
+        } else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("h")) {
+            if let Ok(rel) = p.strip_prefix(root) {
+                let norm = rel
+                    .components()
+                    .filter_map(|c| c.as_os_str().to_str())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                if !norm.is_empty() {
+                    out.push(norm);
+                }
+            }
+        }
+    }
+}
+
+fn load_cheader_preproc_config(manifest_dir: &Path) -> yukic_cheader::PreprocessConfig {
+    let mut include_dirs = Vec::new();
+    let mut defines = Vec::new();
+    for mf in ["yuki.toml", "lib.toml"] {
+        let mf_path = manifest_dir.join(mf);
+        if let Ok(text) = fs::read_to_string(&mf_path) {
+            if let Ok(val) = text.parse::<toml::Value>() {
+                if let Some(c_tbl) = val.get("c").and_then(toml::Value::as_table) {
+                    if let Some(arr) = c_tbl.get("include_dirs").and_then(toml::Value::as_array) {
+                        for item in arr {
+                            if let Some(rel) = item.as_str() {
+                                let p = Path::new(rel);
+                                include_dirs.push(if p.is_absolute() {
+                                    p.to_path_buf()
+                                } else {
+                                    manifest_dir.join(p)
+                                });
+                            }
+                        }
+                    }
+                    if let Some(def_tbl) = c_tbl.get("defines").and_then(toml::Value::as_table) {
+                        for (k, v) in def_tbl {
+                            let s = match v {
+                                toml::Value::String(st) => st.clone(),
+                                toml::Value::Integer(i) => i.to_string(),
+                                toml::Value::Boolean(b) => if *b { "1" } else { "0" }.to_string(),
+                                _ => continue,
+                            };
+                            defines.push((k.clone(), s));
+                        }
+                    } else if let Some(def_arr) = c_tbl.get("defines").and_then(toml::Value::as_array)
+                    {
+                        for entry in def_arr {
+                            if let Some(raw) = entry.as_str() {
+                                if let Some((k, v)) = raw.split_once('=') {
+                                    defines.push((k.trim().to_string(), v.trim().to_string()));
+                                } else {
+                                    defines.push((raw.trim().to_string(), "1".to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+    include_dirs.push(manifest_dir.to_path_buf());
+    yukic_cheader::PreprocessConfig {
+        target: TargetTriple::host(),
+        include_dirs,
+        defines,
+    }
+}
+
+fn index_c_symbol_lines(
+    tracked_files: &[PathBuf],
+    symbols: &BTreeSet<String>,
+) -> HashMap<String, (PathBuf, u32)> {
+    let mut locs = HashMap::new();
+    for file in tracked_files {
+        let Ok(content) = fs::read_to_string(file) else {
+            continue;
+        };
+        for (line_idx, raw_line) in content.lines().enumerate() {
+            let trimmed = raw_line.trim();
+            if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("/*") {
+                continue;
+            }
+            for token in trimmed.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                if !token.is_empty() && symbols.contains(token) && !locs.contains_key(token) {
+                    locs.insert(token.to_string(), (file.clone(), line_idx as u32));
+                }
+            }
+        }
+    }
+    locs
+}
+
+fn collect_item_exports(
+    item: &Item,
+    file_path: &Path,
+    exports: &mut Vec<ExportedSymbol>,
+    _vis: Visibility,
+) {
+    match &item.kind {
             ItemKind::Fun(ref f) => {
                 let params: Vec<String> = f
                     .params
@@ -969,11 +1391,14 @@ fn extract_exports(module: &Module, _source: &str, file_path: &Path) -> Vec<Expo
                 });
             }
             ItemKind::Cfun(ref c) => {
-                let params: Vec<String> = c
+                let mut params: Vec<String> = c
                     .params
                     .iter()
                     .map(|p| format!("{}: {}", p.name.name, p.ty))
                     .collect();
+                if c.is_variadic {
+                    params.push("...".to_string());
+                }
                 let ret = if let Some(ref rt) = c.return_type {
                     format!(" -> {rt}")
                 } else {
@@ -983,6 +1408,16 @@ fn extract_exports(module: &Module, _source: &str, file_path: &Path) -> Vec<Expo
                     name: c.name.name.clone(),
                     kind: "cfun".to_string(),
                     signature: format!("cfun {}({}){};", c.name.name, params.join(", "), ret),
+                    doc: None,
+                    span: item.span,
+                    file_path: file_path.to_path_buf(),
+                });
+            }
+            ItemKind::Cvar(ref cv) => {
+                exports.push(ExportedSymbol {
+                    name: cv.name.name.clone(),
+                    kind: "cvar".to_string(),
+                    signature: format!("cvar {}: {}", cv.name.name, cv.ty),
                     doc: None,
                     span: item.span,
                     file_path: file_path.to_path_buf(),
@@ -1009,19 +1444,20 @@ fn extract_exports(module: &Module, _source: &str, file_path: &Path) -> Vec<Expo
                 });
             }
             ItemKind::Cstruct(ref cs) => {
+                let kw = if cs.is_union { "cunion" } else { "cstruct" };
                 let fields: Vec<String> = cs
                     .fields
                     .iter()
                     .map(|f| format!("{}: {}", f.name.name, f.ty))
                     .collect();
                 let signature = if fields.is_empty() {
-                    format!("cstruct {}", cs.name.name)
+                    format!("{kw} {}", cs.name.name)
                 } else {
-                    format!("cstruct {} {{ {} }}", cs.name.name, fields.join(", "))
+                    format!("{kw} {} {{ {} }}", cs.name.name, fields.join(", "))
                 };
                 exports.push(ExportedSymbol {
                     name: cs.name.name.clone(),
-                    kind: "cstruct".to_string(),
+                    kind: kw.to_string(),
                     signature,
                     doc: None,
                     span: item.span,
@@ -1128,11 +1564,14 @@ fn extract_exports(module: &Module, _source: &str, file_path: &Path) -> Vec<Expo
                 for ext_item in &ext.items {
                     match ext_item {
                         yukic_ast::ExterncItem::Cfun(ref c) => {
-                            let params: Vec<String> = c
+                            let mut params: Vec<String> = c
                                 .params
                                 .iter()
                                 .map(|p| format!("{}: {}", p.name.name, p.ty))
                                 .collect();
+                            if c.is_variadic {
+                                params.push("...".to_string());
+                            }
                             let ret = if let Some(ref rt) = c.return_type {
                                 format!(" -> {rt}")
                             } else {
@@ -1153,22 +1592,33 @@ fn extract_exports(module: &Module, _source: &str, file_path: &Path) -> Vec<Expo
                             });
                         }
                         yukic_ast::ExterncItem::Cstruct(ref cs) => {
+                            let kw = if cs.is_union { "cunion" } else { "cstruct" };
                             let fields: Vec<String> = cs
                                 .fields
                                 .iter()
                                 .map(|f| format!("{}: {}", f.name.name, f.ty))
                                 .collect();
                             let signature = if fields.is_empty() {
-                                format!("cstruct {}", cs.name.name)
+                                format!("{kw} {}", cs.name.name)
                             } else {
-                                format!("cstruct {} {{ {} }}", cs.name.name, fields.join(", "))
+                                format!("{kw} {} {{ {} }}", cs.name.name, fields.join(", "))
                             };
                             exports.push(ExportedSymbol {
                                 name: cs.name.name.clone(),
-                                kind: "cstruct".to_string(),
+                                kind: kw.to_string(),
                                 signature,
                                 doc: None,
                                 span: cs.span,
+                                file_path: file_path.to_path_buf(),
+                            });
+                        }
+                        yukic_ast::ExterncItem::Cvar(ref cv) => {
+                            exports.push(ExportedSymbol {
+                                name: cv.name.name.clone(),
+                                kind: "cvar".to_string(),
+                                signature: format!("cvar {}: {}", cv.name.name, cv.ty),
+                                doc: None,
+                                span: cv.span,
                                 file_path: file_path.to_path_buf(),
                             });
                         }
@@ -1177,7 +1627,4 @@ fn extract_exports(module: &Module, _source: &str, file_path: &Path) -> Vec<Expo
             }
             _ => {}
         }
-    }
-
-    exports
 }

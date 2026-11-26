@@ -20,8 +20,13 @@ pub fn analyze_document(
     let lexer = Lexer::new(file_id, &doc.text);
     let (tokens, mut diags) = lexer.tokenize();
 
+    let is_ykni = doc.uri.path().ends_with(".ykni");
     let mut parser = Parser::with_file_id(tokens, file_id);
-    let (module, mut parser_diags) = parser.parse_module();
+    let (module, mut parser_diags) = if is_ykni {
+        parser.parse_interface_module()
+    } else {
+        parser.parse_module()
+    };
     diags.append(&mut parser_diags);
 
     let mut lsp_diags: Vec<LspDiagnostic> = diags
@@ -39,14 +44,16 @@ pub fn analyze_document(
         true
     });
 
-    let current_file = doc.uri.to_file_path().unwrap_or_default();
-    if let Some(workspace_env) = env {
-        validate_imports(&module, doc, current_file.as_path(), workspace_env, &mut lsp_diags);
+    if !is_ykni {
+        let current_file = doc.uri.to_file_path().unwrap_or_default();
+        if let Some(workspace_env) = env {
+            validate_imports(&module, doc, current_file.as_path(), workspace_env, &mut lsp_diags);
+        }
+        validate_numeric_bounds(&module, doc, &mut lsp_diags);
+        validate_symbol_scopes(&module, doc, current_file.as_path(), env, &mut lsp_diags);
+        crate::type_check::validate_types_and_calls(&module, doc, current_file.as_path(), env, &mut lsp_diags);
+        crate::lint::run_lint_checks(&module, doc, &mut lsp_diags);
     }
-    validate_numeric_bounds(&module, doc, &mut lsp_diags);
-    validate_symbol_scopes(&module, doc, current_file.as_path(), env, &mut lsp_diags);
-    crate::type_check::validate_types_and_calls(&module, doc, current_file.as_path(), env, &mut lsp_diags);
-    crate::lint::run_lint_checks(&module, doc, &mut lsp_diags);
 
     let mut seen_keys = HashSet::new();
     lsp_diags.retain(|d| {
@@ -111,6 +118,22 @@ fn validate_imports(
                         }
                     }
                 }
+            }
+        } else if let ItemKind::Cload(ref decl) = item.kind {
+            let hdr = env.get_or_load_cheader(&decl.path, current_file);
+            if let Some(ref err_msg) = hdr.error {
+                let range = doc.span_to_range(decl.span.start, decl.span.end);
+                diags.push(LspDiagnostic {
+                    range,
+                    severity: Some(LspSeverity::ERROR),
+                    code: Some(NumberOrString::String("E0701".to_string())),
+                    code_description: None,
+                    source: Some("yukino".to_string()),
+                    message: format!("Failed to load C header '{}': {err_msg}", decl.path),
+                    related_information: None,
+                    tags: None,
+                    data: None,
+                });
             }
         }
     }
@@ -210,16 +233,22 @@ fn validate_numeric_bounds(
     for item in &module.items {
         match &item.kind {
             ItemKind::Fun(ref f) => {
-                check_block_numeric_bounds(&f.body, doc, diags);
+                if let Some(ref body) = f.body {
+                    check_block_numeric_bounds(body, doc, diags);
+                }
             }
             ItemKind::Class(ref c) => {
                 for m in &c.methods {
-                    check_block_numeric_bounds(&m.body, doc, diags);
+                    if let Some(ref body) = m.body {
+                        check_block_numeric_bounds(body, doc, diags);
+                    }
                 }
             }
             ItemKind::Struct(ref s) => {
                 for m in &s.methods {
-                    check_block_numeric_bounds(&m.body, doc, diags);
+                    if let Some(ref body) = m.body {
+                        check_block_numeric_bounds(body, doc, diags);
+                    }
                 }
             }
             ItemKind::Static(ref s) => {
@@ -413,42 +442,50 @@ fn validate_symbol_scopes(
     for item in &module.items {
         match &item.kind {
             ItemKind::Fun(ref f) => {
-                let mut scopes = vec![HashSet::new()];
-                for p in &f.params {
-                    scopes[0].insert(p.name.name.clone());
+                if let Some(ref body) = f.body {
+                    let mut scopes = vec![HashSet::new()];
+                    for p in &f.params {
+                        scopes[0].insert(p.name.name.clone());
+                    }
+                    validate_block(body, &mut scopes, &global_symbols, doc, diags);
                 }
-                validate_block(&f.body, &mut scopes, &global_symbols, doc, diags);
             }
             ItemKind::Class(ref cls) => {
                 let has_parent = cls.base_class.is_some();
                 for m in &cls.methods {
-                    let mut scopes = vec![HashSet::new()];
-                    scopes[0].insert("this".to_string());
-                    if has_parent {
-                        scopes[0].insert("super".to_string());
+                    if let Some(ref body) = m.body {
+                        let mut scopes = vec![HashSet::new()];
+                        scopes[0].insert("this".to_string());
+                        if has_parent {
+                            scopes[0].insert("super".to_string());
+                        }
+                        for p in &m.params {
+                            scopes[0].insert(p.name.name.clone());
+                        }
+                        validate_block(body, &mut scopes, &global_symbols, doc, diags);
                     }
-                    for p in &m.params {
-                        scopes[0].insert(p.name.name.clone());
-                    }
-                    validate_block(&m.body, &mut scopes, &global_symbols, doc, diags);
                 }
                 for a in &cls.accessors {
-                    let mut scopes = vec![HashSet::new()];
-                    scopes[0].insert("this".to_string());
-                    if has_parent {
-                        scopes[0].insert("super".to_string());
+                    if let Some(ref body) = a.body {
+                        let mut scopes = vec![HashSet::new()];
+                        scopes[0].insert("this".to_string());
+                        if has_parent {
+                            scopes[0].insert("super".to_string());
+                        }
+                        validate_block(body, &mut scopes, &global_symbols, doc, diags);
                     }
-                    validate_block(&a.body, &mut scopes, &global_symbols, doc, diags);
                 }
             }
             ItemKind::Struct(ref s) => {
                 for m in &s.methods {
-                    let mut scopes = vec![HashSet::new()];
-                    scopes[0].insert("this".to_string());
-                    for p in &m.params {
-                        scopes[0].insert(p.name.name.clone());
+                    if let Some(ref body) = m.body {
+                        let mut scopes = vec![HashSet::new()];
+                        scopes[0].insert("this".to_string());
+                        for p in &m.params {
+                            scopes[0].insert(p.name.name.clone());
+                        }
+                        validate_block(body, &mut scopes, &global_symbols, doc, diags);
                     }
-                    validate_block(&m.body, &mut scopes, &global_symbols, doc, diags);
                 }
             }
             _ => {}
@@ -464,13 +501,16 @@ fn collect_global_symbols(
     let mut symbols = HashSet::new();
 
     let builtins = [
-        "null", "space", "true", "false", "errkind",
+        "null", "space", "true", "false", "errkind", "extern",
         "cast", "panic", "typeof!", "args", "raw_args", "exit", "assert",
         "ptr_of", "from_raw_parts", "file!", "line!", "column!", "module_path!",
         "cfg!", "include_str!", "include_bytes!",
         "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64",
         "float32", "float64", "bool", "char", "string", "bytes", "void", "never",
         "usize", "isize",
+        "c_char", "c_schar", "c_uchar", "c_short", "c_ushort",
+        "c_int", "c_uint", "c_long", "c_ulong", "c_longlong", "c_ulonglong",
+        "c_size_t", "c_ssize_t", "c_bool", "c_void",
     ];
     for b in builtins {
         symbols.insert(b.to_string());
@@ -489,6 +529,7 @@ fn collect_global_symbols(
         match &item.kind {
             ItemKind::Fun(ref f) => { symbols.insert(f.name.name.clone()); }
             ItemKind::Cfun(ref c) => { symbols.insert(c.name.name.clone()); }
+            ItemKind::Cvar(ref cv) => { symbols.insert(cv.name.name.clone()); }
             ItemKind::Class(ref c) => { symbols.insert(c.name.name.clone()); }
             ItemKind::Struct(ref s) => { symbols.insert(s.name.name.clone()); }
             ItemKind::Cstruct(ref cs) => { symbols.insert(cs.name.name.clone()); }
@@ -508,14 +549,30 @@ fn collect_global_symbols(
             ItemKind::TypeAlias(ref ta) => { symbols.insert(ta.name.name.clone()); }
             ItemKind::Alias(ref a) => { symbols.insert(a.alias.name.clone()); }
             ItemKind::Externc(ref ext) => {
+                if let Some(ref ns) = ext.namespace {
+                    symbols.insert(ns.clone());
+                }
                 for ext_item in &ext.items {
                     match ext_item {
                         ExterncItem::Cfun(ref c) => { symbols.insert(c.name.name.clone()); }
                         ExterncItem::Cstruct(ref cs) => { symbols.insert(cs.name.name.clone()); }
+                        ExterncItem::Cvar(ref cv) => { symbols.insert(cv.name.name.clone()); }
                     }
                 }
             }
             _ => {}
+        }
+    }
+
+    if let Some(workspace_env) = env {
+        for (_decl, hdr) in workspace_env.collect_cload_headers(module, current_file) {
+            if hdr.error.is_none() {
+                symbols.insert(hdr.namespace.clone());
+                for sym in &hdr.symbols {
+                    symbols.insert(sym.clone());
+                    symbols.insert(format!("{}::{sym}", hdr.namespace));
+                }
+            }
         }
     }
 
@@ -1324,6 +1381,18 @@ mod tests {
             "never rewritten variable should trigger W0005, got: {:?}",
             diags
         );
+
+        let text2 = "fun helper() -> int64 { return 1 }\nfun take_mut(ref ~v: int64) {\n    rewrite v += 1\n}\nfun test2() {\n    set const_int = 42\n    set const_expr = 1 + 2 * -3\n    set mutated = 5\n    set borrowed_mut = 7\n    set from_call = helper()\n    set from_var = const_int + 1\n    set arr = [1, 2]\n    set empty_arr: int64[]\n    static already_static = 99\n    rewrite mutated = 6\n    take_mut(ref ~borrowed_mut)\n    arr.push(3)\n    println(\"${const_int} ${const_expr} ${mutated} ${borrowed_mut} ${from_call} ${from_var} ${already_static} ${empty_arr.len()}\")\n}\n";
+        let doc2 = Document::new(Url::parse("file:///test2.ykn").unwrap(), text2.to_string(), 1);
+        let (_, diags2) = analyze_document(&doc2, None);
+        let w0005_msgs: Vec<&str> = diags2
+            .iter()
+            .filter(|d| d.code == Some(NumberOrString::String("W0005".to_string())))
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(w0005_msgs.len(), 2, "expected W0005 only on const_int and const_expr, got: {w0005_msgs:?}");
+        assert!(w0005_msgs[0].contains("const_int"));
+        assert!(w0005_msgs[1].contains("const_expr"));
     }
 
     #[test]
@@ -1610,5 +1679,168 @@ fun test() {
 
         let module_errors: Vec<_> = diags.iter().filter(|d| d.code == Some(NumberOrString::String("E0301".to_string()))).collect();
         assert!(module_errors.is_empty(), "load siesta should find siesta library dependency, got: {:?}", module_errors);
+    }
+
+    #[test]
+    fn test_class_static_and_default_fields() {
+        let text = "class Cfg {\n    static LIMIT: int32 = 10\n    set port: int32 = 8080\n    bad_expr: int32 = 1 + 2\n}\nfun demo() {\n    set c = init Cfg()\n    rewrite c.port = 9090\n    rewrite c.LIMIT = 20\n}\n";
+        let doc = Document::new(Url::parse("file:///test_cls.ykn").unwrap(), text.to_string(), 1);
+        let (_, diags) = analyze_document(&doc, None);
+        assert!(
+            diags.iter().any(|d| d.code == Some(NumberOrString::String("E0503".to_string())) && d.message.contains("LIMIT")),
+            "mutating static class field should emit E0503, got: {:?}",
+            diags
+        );
+        assert!(
+            diags.iter().any(|d| d.code == Some(NumberOrString::String("E0401".to_string())) && d.message.contains("bad_expr")),
+            "non-literal field default should emit E0401, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_cload_headers_cunion_cvar_variadic_and_lsp_queries() {
+        let root = std::env::temp_dir().join(format!("yukino_lsp_cload_diag_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("native")).unwrap();
+        std::fs::write(root.join("yuki.toml"), "[package]\nname = \"cload_diag\"\nversion = \"0.1.0\"\n").unwrap();
+        std::fs::write(
+            root.join("native/api.h"),
+            "#define API_VER 1\ntypedef struct Packet {\n    int id;\n    int tag;\n} Packet;\ntypedef union ValueUnion {\n    int i;\n    double f;\n} ValueUnion;\nextern int global_counter;\nint c_add(int a, int b);\nvoid c_log(int level, ...);\n",
+        )
+        .unwrap();
+
+        let main_path = root.join("src/main.ykn");
+        let uri = Url::from_file_path(&main_path).unwrap();
+        let env = WorkspaceEnv::for_path(&main_path);
+
+        // Valid C header usage: direct + api:: namespace, cunion 1-field/0-field, variadic cfun, cvar.
+        let valid_text = "cload \"native/api.h\"\nfun main() {\n    set a: c_int = api::c_add(1, 2)\n    set b: c_int = c_add(a, global_counter)\n    set v = ValueUnion { i: API_VER }\n    set e = ValueUnion {}\n    set p = Packet { id: b, tag: v.i }\n    c_log(p.id, e)\n}\n";
+        let valid_doc = Document::new(uri.clone(), valid_text.to_string(), 1);
+        let (valid_mod, valid_diags) = analyze_document(&valid_doc, Some(&env));
+        let errors: Vec<_> = valid_diags
+            .iter()
+            .filter(|d| d.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR))
+            .collect();
+        assert!(errors.is_empty(), "valid cload/cunion/cvar code should have zero errors, got: {:?}", errors);
+
+        // Hover on cload symbol & path, Go-to-Definition into native/api.h, signature help on api::c_add.
+        let pos_sym = tower_lsp::lsp_types::Position::new(3, 21);
+        let hover_sym = crate::hover::compute_hover(&valid_doc, pos_sym, &valid_mod, &env)
+            .expect("expected hover on c_add");
+        let hover_json = serde_json::to_string(&hover_sym).unwrap();
+        assert!(hover_json.contains("c_add"), "hover should describe c_add: {hover_json}");
+
+        let def = crate::definition::compute_definition(&valid_doc, pos_sym, &valid_mod, &env)
+            .expect("expected definition for c_add");
+        match def {
+            tower_lsp::lsp_types::GotoDefinitionResponse::Scalar(loc) => {
+                assert!(loc.uri.path().ends_with("native/api.h"), "expected definition in native/api.h, got: {}", loc.uri);
+            }
+            _ => panic!("expected scalar location"),
+        }
+
+        let pos_sig = tower_lsp::lsp_types::Position::new(2, 30);
+        let sig = crate::signature_help::compute_signature_help(&valid_doc, pos_sig, &valid_mod, &env)
+            .expect("expected signature help for api::c_add(");
+        assert!(sig.signatures[0].label.contains("c_add"), "expected c_add signature, got: {}", sig.signatures[0].label);
+
+        // Invalid cunion (>1 field) + missing header E0701.
+        let bad_text = "cload \"native/missing.h\"\ncload \"native/api.h\"\nfun main() {\n    set bad = ValueUnion { i: 1, f: 2.0 }\n}\n";
+        let bad_doc = Document::new(uri, bad_text.to_string(), 1);
+        let (_, bad_diags) = analyze_document(&bad_doc, Some(&env));
+        assert!(
+            bad_diags.iter().any(|d| d.code == Some(NumberOrString::String("E0701".to_string()))),
+            "missing header must emit E0701, got: {:?}",
+            bad_diags
+        );
+        assert!(
+            bad_diags.iter().any(|d| d.code == Some(NumberOrString::String("E0401".to_string())) && d.message.contains("union")),
+            "cunion >1 field must emit E0401, got: {:?}",
+            bad_diags
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_ykni_prebuilt_lsp_queries_and_document_symbols() {
+        let root = std::env::temp_dir().join(format!("yukino_lsp_ykni_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("vendor")).unwrap();
+        std::fs::write(
+            root.join("yuki.toml"),
+            "[package]\nname = \"ykni_consumer\"\nversion = \"0.1.0\"\n\n[libs.runtime.mathlib]\ninterface = \"vendor/mathlib.ykni\"\narchive = \"vendor/libmathlib.a\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("vendor/libmathlib.a"), b"!<arch>\n").unwrap();
+        std::fs::write(
+            root.join("vendor/mathlib.ykni"),
+            "#![ykni::version(1)]\n#![ykni::package(name = \"mathlib\", version = \"0.1.0\", kind = \"static\")]\nnamespace mathlib {\n    public struct Vec2 {\n        x: int32\n        y: int32\n    }\n    #[ykni::symbol(\"__yukifun_add_nums_int32_int32__int32\")]\n    public fun add_nums(a: int32, b: int32 = 1) -> int32\n}\nnamespace mathlib.extra {\n    #[ykni::symbol(\"__yukifun_scale__int32\")]\n    public fun scale(v: int32) -> int32\n}\n",
+        )
+        .unwrap();
+
+        let main_path = root.join("src/main.ykn");
+        let uri = Url::from_file_path(&main_path).unwrap();
+        let env = WorkspaceEnv::for_path(&main_path);
+
+        assert!(env.available_libs.contains(&"mathlib".to_string()));
+        assert!(env.list_package_submodules("mathlib").contains(&"extra".to_string()));
+
+        let text = "load mathlib\nfun main() {\n    set v = Vec2 { x: 1, y: 2 }\n    set s = add_nums(v.x, 3)\n}\n";
+        let doc = Document::new(uri, text.to_string(), 1);
+        let (module, diags) = analyze_document(&doc, Some(&env));
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR))
+            .collect();
+        assert!(errors.is_empty(), "valid prebuilt ykni usage must have zero errors, got: {:?}", errors);
+
+        let pos_call = tower_lsp::lsp_types::Position::new(3, 14);
+        let hover = crate::hover::compute_hover(&doc, pos_call, &module, &env).expect("hover on add_nums");
+        let hover_json = serde_json::to_string(&hover).unwrap();
+        assert!(hover_json.contains("add_nums"), "hover should include add_nums: {hover_json}");
+
+        let def = crate::definition::compute_definition(&doc, pos_call, &module, &env).expect("definition for add_nums");
+        match def {
+            tower_lsp::lsp_types::GotoDefinitionResponse::Scalar(loc) => {
+                assert!(loc.uri.path().ends_with("vendor/mathlib.ykni"), "expected definition in mathlib.ykni, got: {}", loc.uri);
+            }
+            _ => panic!("expected scalar location"),
+        }
+
+        let sig = crate::signature_help::compute_signature_help(
+            &doc,
+            tower_lsp::lsp_types::Position::new(3, 22),
+            &module,
+            &env,
+        )
+        .expect("signature help for add_nums(");
+        assert!(sig.signatures[0].label.contains("add_nums"), "expected add_nums signature, got: {}", sig.signatures[0].label);
+
+        let ykni_file = root.join("vendor/mathlib.ykni");
+        let ykni_doc = Document::new(
+            Url::from_file_path(&ykni_file).unwrap(),
+            std::fs::read_to_string(&ykni_file).unwrap(),
+            1,
+        );
+        let (ykni_mod, ykni_diags) = analyze_document(&ykni_doc, Some(&env));
+        let ykni_errors: Vec<_> = ykni_diags
+            .iter()
+            .filter(|d| d.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR))
+            .collect();
+        assert!(ykni_errors.is_empty(), "valid .ykni file must have zero errors, got: {:?}", ykni_errors);
+
+        let syms = crate::symbols::compute_document_symbols(&ykni_doc, &ykni_mod).expect("document symbols for .ykni");
+        match syms {
+            tower_lsp::lsp_types::DocumentSymbolResponse::Nested(items) => {
+                assert!(items.iter().any(|s| s.name == "mathlib"), "expected mathlib namespace symbol");
+            }
+            _ => panic!("expected nested symbols"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

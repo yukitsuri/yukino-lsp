@@ -36,6 +36,7 @@ pub struct StructInfo {
     pub name: String,
     pub fields: Vec<StructFieldInfo>,
     pub methods: HashMap<String, FnSigInfo>,
+    pub is_union: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +44,7 @@ pub struct ClassInfo {
     pub name: String,
     pub base_class: Option<String>,
     pub fields: HashMap<String, String>,
+    pub static_fields: HashSet<String>,
     pub methods: HashMap<String, FnSigInfo>,
 }
 
@@ -102,31 +104,14 @@ pub fn validate_types_and_calls(
     for item in &module.items {
         match &item.kind {
             ItemKind::Fun(ref f) => {
-                let ret_ty = f.return_type.as_ref().map(|t| t.to_string());
-                check_fun_like(
-                    &f.name.name,
-                    &f.params,
-                    ret_ty.as_deref(),
-                    &f.body,
-                    None,
-                    &fn_sigs,
-                    &struct_defs,
-                    &class_defs,
-                    &global_vars,
-                    doc,
-                    diags,
-                );
-            }
-            ItemKind::Class(ref c) => {
-                let class_name = &c.name.name;
-                for m in &c.methods {
-                    let ret_ty = m.return_type.as_ref().map(|t| t.to_string());
+                if let Some(ref body) = f.body {
+                    let ret_ty = f.return_type.as_ref().map(|t| t.to_string());
                     check_fun_like(
-                        &m.name.name,
-                        &m.params,
+                        &f.name.name,
+                        &f.params,
                         ret_ty.as_deref(),
-                        &m.body,
-                        Some(class_name),
+                        body,
+                        None,
                         &fn_sigs,
                         &struct_defs,
                         &class_defs,
@@ -135,40 +120,144 @@ pub fn validate_types_and_calls(
                         diags,
                     );
                 }
+            }
+            ItemKind::Class(ref c) => {
+                let class_name = &c.name.name;
+                let mut empty_locals = HashMap::new();
+                for f in &c.fields {
+                    let expected_ty = f.ty.to_string();
+                    if f.is_static && f.default_val.is_none() {
+                        let range = doc.span_to_range(f.span.start, f.span.end);
+                        diags.push(LspDiagnostic {
+                            range,
+                            severity: Some(LspSeverity::ERROR),
+                            code: Some(NumberOrString::String("E0401".to_string())),
+                            code_description: None,
+                            source: Some("yukino".to_string()),
+                            message: format!(
+                                "static field '{}' in class '{}' must have an initializer",
+                                f.name.name, class_name
+                            ),
+                            related_information: None,
+                            tags: None,
+                            data: None,
+                        });
+                        continue;
+                    }
+                    if let Some(ref val) = f.default_val {
+                        if !is_literal_expr(val) {
+                            let range = doc.span_to_range(val.span.start, val.span.end);
+                            diags.push(LspDiagnostic {
+                                range,
+                                severity: Some(LspSeverity::ERROR),
+                                code: Some(NumberOrString::String("E0401".to_string())),
+                                code_description: None,
+                                source: Some("yukino".to_string()),
+                                message: format!(
+                                    "{} '{}' in class '{}' must be initialized with a literal",
+                                    if f.is_static { "static field" } else { "field default" },
+                                    f.name.name,
+                                    class_name
+                                ),
+                                related_information: None,
+                                tags: None,
+                                data: None,
+                            });
+                        } else if let Some(actual) = infer_expr_type(
+                            val,
+                            &empty_locals,
+                            &global_vars,
+                            &fn_sigs,
+                            &struct_defs,
+                            &class_defs,
+                            Some(class_name),
+                        ) {
+                            if !is_type_compatible(&expected_ty, &actual) {
+                                let range = doc.span_to_range(val.span.start, val.span.end);
+                                diags.push(LspDiagnostic {
+                                    range,
+                                    severity: Some(LspSeverity::ERROR),
+                                    code: Some(NumberOrString::String("E0401".to_string())),
+                                    code_description: None,
+                                    source: Some("yukino".to_string()),
+                                    message: format!(
+                                        "Mismatched types: expected '{expected_ty}', found '{actual}'"
+                                    ),
+                                    related_information: None,
+                                    tags: None,
+                                    data: None,
+                                });
+                            }
+                        }
+                        check_expr(
+                            val,
+                            &mut empty_locals,
+                            &global_vars,
+                            &fn_sigs,
+                            &struct_defs,
+                            &class_defs,
+                            Some(class_name),
+                            doc,
+                            diags,
+                        );
+                    }
+                }
+                for m in &c.methods {
+                    if let Some(ref body) = m.body {
+                        let ret_ty = m.return_type.as_ref().map(|t| t.to_string());
+                        check_fun_like(
+                            &m.name.name,
+                            &m.params,
+                            ret_ty.as_deref(),
+                            body,
+                            Some(class_name),
+                            &fn_sigs,
+                            &struct_defs,
+                            &class_defs,
+                            &global_vars,
+                            doc,
+                            diags,
+                        );
+                    }
+                }
                 for a in &c.accessors {
-                    let acc_ty = a.ty.to_string();
-                    check_fun_like(
-                        &a.name.name,
-                        &[],
-                        Some(&acc_ty),
-                        &a.body,
-                        Some(class_name),
-                        &fn_sigs,
-                        &struct_defs,
-                        &class_defs,
-                        &global_vars,
-                        doc,
-                        diags,
-                    );
+                    if let Some(ref body) = a.body {
+                        let acc_ty = a.ty.to_string();
+                        check_fun_like(
+                            &a.name.name,
+                            &[],
+                            Some(&acc_ty),
+                            body,
+                            Some(class_name),
+                            &fn_sigs,
+                            &struct_defs,
+                            &class_defs,
+                            &global_vars,
+                            doc,
+                            diags,
+                        );
+                    }
                 }
             }
             ItemKind::Struct(ref s) => {
                 let struct_name = &s.name.name;
                 for m in &s.methods {
-                    let ret_ty = m.return_type.as_ref().map(|t| t.to_string());
-                    check_fun_like(
-                        &m.name.name,
-                        &m.params,
-                        ret_ty.as_deref(),
-                        &m.body,
-                        Some(struct_name),
-                        &fn_sigs,
-                        &struct_defs,
-                        &class_defs,
-                        &global_vars,
-                        doc,
-                        diags,
-                    );
+                    if let Some(ref body) = m.body {
+                        let ret_ty = m.return_type.as_ref().map(|t| t.to_string());
+                        check_fun_like(
+                            &m.name.name,
+                            &m.params,
+                            ret_ty.as_deref(),
+                            body,
+                            Some(struct_name),
+                            &fn_sigs,
+                            &struct_defs,
+                            &class_defs,
+                            &global_vars,
+                            doc,
+                            diags,
+                        );
+                    }
                 }
             }
             ItemKind::Static(ref s) => {
@@ -212,70 +301,14 @@ fn collect_signatures(
     register_builtins(&mut fn_sigs);
 
     for item in &module.items {
-        match &item.kind {
-            ItemKind::Fun(f) => {
-                fn_sigs.insert(f.name.name.clone(), make_fn_sig(&f.name.name, &f.params, f.return_type.as_ref()));
-            }
-            ItemKind::Cfun(cf) => {
-                let params: Vec<ParamSig> = cf.params.iter().map(|p| ParamSig {
-                    name: p.name.name.clone(),
-                    ty: Some(p.ty.to_string()),
-                    has_default: false,
-                    is_variadic: false,
-                }).collect();
-                fn_sigs.insert(cf.name.name.clone(), FnSigInfo {
-                    name: cf.name.name.clone(),
-                    params,
-                    return_type: cf.return_type.as_ref().map(|t| t.to_string()),
-                });
-            }
-            ItemKind::Struct(s) => {
-                let fields = s.fields.iter().map(|f| StructFieldInfo {
-                    name: f.name.name.clone(),
-                    ty: f.ty.to_string(),
-                    has_default: f.default_val.is_some(),
-                }).collect();
-                let mut methods = HashMap::new();
-                for m in &s.methods {
-                    methods.insert(m.name.name.clone(), make_fn_sig(&m.name.name, &m.params, m.return_type.as_ref()));
-                }
-                struct_defs.insert(s.name.name.clone(), StructInfo {
-                    name: s.name.name.clone(),
-                    fields,
-                    methods,
-                });
-            }
-            ItemKind::Class(c) => {
-                let mut fields = HashMap::new();
-                for f in &c.fields {
-                    fields.insert(f.name.name.clone(), f.ty.to_string());
-                }
-                let mut methods = HashMap::new();
-                for m in &c.methods {
-                    methods.insert(m.name.name.clone(), make_fn_sig(&m.name.name, &m.params, m.return_type.as_ref()));
-                }
-                class_defs.insert(c.name.name.clone(), ClassInfo {
-                    name: c.name.name.clone(),
-                    base_class: c.base_class.as_ref().map(|b| b.name.clone()),
-                    fields,
-                    methods,
-                });
-            }
-            ItemKind::Static(s) => {
-                let ty = if let Some(ref t) = s.ty {
-                    t.to_string()
-                } else {
-                    infer_static_init_type(&s.init)
-                };
-                let fixed_size = parse_array_type(&ty).and_then(|a| a.size);
-                global_vars.insert(s.name.name.clone(), VarInfo {
-                    ty,
-                    is_static: true,
-                    fixed_size,
-                });
-            }
-            _ => {}
-        }
+        register_item_signatures(
+            item,
+            None,
+            &mut fn_sigs,
+            &mut struct_defs,
+            &mut class_defs,
+            &mut global_vars,
+        );
     }
 
     if let Some(workspace_env) = env {
@@ -290,6 +323,33 @@ fn collect_signatures(
                 }],
                 return_type: None,
             });
+        }
+
+        for (_decl, hdr) in workspace_env.collect_cload_headers(module, current_file) {
+            if hdr.error.is_none() {
+                let mut ns_aliases = HashMap::new();
+                for hdr_item in &hdr.items {
+                    register_item_signatures(
+                        hdr_item,
+                        None,
+                        &mut fn_sigs,
+                        &mut struct_defs,
+                        &mut class_defs,
+                        &mut global_vars,
+                    );
+                    register_ns_aliases_for_item(
+                        hdr_item,
+                        &hdr.namespace,
+                        &mut ns_aliases,
+                        &mut fn_sigs,
+                        &mut struct_defs,
+                        &mut global_vars,
+                    );
+                }
+                for (k, v) in ns_aliases {
+                    global_vars.entry(k).or_insert(v);
+                }
+            }
         }
 
         for item in &module.items {
@@ -310,12 +370,22 @@ fn collect_signatures(
         }
     }
 
+    // Propagate StructInfo across typedef aliases (e.g. `typedef struct Vec3 Vec3Alias`).
+    for item in &module.items {
+        if let ItemKind::TypeAlias(ref ta) = item.kind {
+            if let Some(s) = struct_defs.get(&ta.target.to_string()).cloned() {
+                struct_defs.entry(ta.name.name.clone()).or_insert(s);
+            }
+        }
+    }
+
     if let Some(parent) = current_file.parent() {
         for cls in crate::workspace::scan_spes_classes(parent) {
             class_defs.entry(cls.clone()).or_insert_with(|| ClassInfo {
                 name: cls,
                 base_class: None,
                 fields: HashMap::new(),
+                static_fields: HashSet::new(),
                 methods: HashMap::new(),
             });
         }
@@ -422,23 +492,85 @@ fn register_item_signatures(
         }
         ItemKind::Cfun(cf) => {
             let name = alias.unwrap_or(&cf.name.name);
-            let params: Vec<ParamSig> = cf.params.iter().map(|p| ParamSig {
-                name: p.name.name.clone(),
-                ty: Some(p.ty.to_string()),
-                has_default: false,
-                is_variadic: false,
+            let sig = make_cfun_sig(name, cf);
+            fn_sigs.insert(name.to_string(), sig);
+        }
+        ItemKind::Cstruct(cs) => {
+            let name = alias.unwrap_or(&cs.name.name);
+            let fields = cs.fields.iter().map(|f| StructFieldInfo {
+                name: f.name.name.clone(),
+                ty: f.ty.to_string(),
+                has_default: f.default_val.is_some(),
             }).collect();
-            fn_sigs.insert(name.to_string(), FnSigInfo {
+            struct_defs.insert(name.to_string(), StructInfo {
                 name: name.to_string(),
-                params,
-                return_type: cf.return_type.as_ref().map(|t| t.to_string()),
+                fields,
+                methods: HashMap::new(),
+                is_union: cs.is_union,
             });
+        }
+        ItemKind::Cvar(cv) => {
+            let name = alias.unwrap_or(&cv.name.name);
+            let ty = cv.ty.to_string();
+            let fixed_size = parse_array_type(&ty).and_then(|a| a.size);
+            global_vars.insert(name.to_string(), VarInfo {
+                ty,
+                is_static: false,
+                fixed_size,
+            });
+        }
+        ItemKind::Externc(ext) => {
+            for ei in &ext.items {
+                match ei {
+                    ExterncItem::Cfun(cf) => {
+                        let sig = make_cfun_sig(&cf.name.name, cf);
+                        fn_sigs.insert(cf.name.name.clone(), sig.clone());
+                        if let Some(ref ns) = ext.namespace {
+                            fn_sigs.insert(format!("{ns}::{}", cf.name.name), sig);
+                        }
+                    }
+                    ExterncItem::Cstruct(cs) => {
+                        let fields: Vec<StructFieldInfo> = cs.fields.iter().map(|f| StructFieldInfo {
+                            name: f.name.name.clone(),
+                            ty: f.ty.to_string(),
+                            has_default: f.default_val.is_some(),
+                        }).collect();
+                        let s_info = StructInfo {
+                            name: cs.name.name.clone(),
+                            fields,
+                            methods: HashMap::new(),
+                            is_union: cs.is_union,
+                        };
+                        struct_defs.insert(cs.name.name.clone(), s_info.clone());
+                        if let Some(ref ns) = ext.namespace {
+                            struct_defs.insert(format!("{ns}::{}", cs.name.name), s_info);
+                        }
+                    }
+                    ExterncItem::Cvar(cv) => {
+                        let ty = cv.ty.to_string();
+                        let fixed_size = parse_array_type(&ty).and_then(|a| a.size);
+                        let vi = VarInfo {
+                            ty,
+                            is_static: false,
+                            fixed_size,
+                        };
+                        global_vars.insert(cv.name.name.clone(), vi.clone());
+                        if let Some(ref ns) = ext.namespace {
+                            global_vars.insert(format!("{ns}::{}", cv.name.name), vi);
+                        }
+                    }
+                }
+            }
         }
         ItemKind::Class(c) => {
             let name = alias.unwrap_or(&c.name.name);
             let mut fields = HashMap::new();
+            let mut static_fields = HashSet::new();
             for f in &c.fields {
                 fields.insert(f.name.name.clone(), f.ty.to_string());
+                if f.is_static {
+                    static_fields.insert(f.name.name.clone());
+                }
             }
             let mut methods = HashMap::new();
             for m in &c.methods {
@@ -448,6 +580,7 @@ fn register_item_signatures(
                 name: name.to_string(),
                 base_class: c.base_class.as_ref().map(|b| b.name.clone()),
                 fields: fields.clone(),
+                static_fields: static_fields.clone(),
                 methods: methods.clone(),
             });
             if alias.is_some() {
@@ -455,6 +588,7 @@ fn register_item_signatures(
                     name: c.name.name.clone(),
                     base_class: c.base_class.as_ref().map(|b| b.name.clone()),
                     fields,
+                    static_fields,
                     methods,
                 });
             }
@@ -474,6 +608,7 @@ fn register_item_signatures(
                 name: name.to_string(),
                 fields,
                 methods,
+                is_union: false,
             });
         }
         ItemKind::Static(s) => {
@@ -490,6 +625,72 @@ fn register_item_signatures(
                 fixed_size,
             });
         }
+        ItemKind::TypeAlias(ta) => {
+            if let Some(s) = struct_defs.get(&ta.target.to_string()).cloned() {
+                struct_defs.insert(ta.name.name.clone(), s);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn make_cfun_sig(name: &str, cf: &CfunDecl) -> FnSigInfo {
+    let mut params: Vec<ParamSig> = cf.params.iter().map(|p| ParamSig {
+        name: p.name.name.clone(),
+        ty: Some(p.ty.to_string()),
+        has_default: false,
+        is_variadic: false,
+    }).collect();
+    if cf.is_variadic {
+        params.push(ParamSig {
+            name: "...".to_string(),
+            ty: None,
+            has_default: false,
+            is_variadic: true,
+        });
+    }
+    FnSigInfo {
+        name: name.to_string(),
+        params,
+        return_type: cf.return_type.as_ref().map(|t| t.to_string()),
+    }
+}
+
+fn register_ns_aliases_for_item(
+    item: &Item,
+    ns: &str,
+    out_vars: &mut HashMap<String, VarInfo>,
+    fn_sigs: &mut HashMap<String, FnSigInfo>,
+    struct_defs: &mut HashMap<String, StructInfo>,
+    global_vars: &mut HashMap<String, VarInfo>,
+) {
+    match &item.kind {
+        ItemKind::Static(s) => {
+            if let Some(v) = global_vars.get(&s.name.name).cloned() {
+                out_vars.insert(format!("{ns}::{}", s.name.name), v);
+            }
+        }
+        ItemKind::Cfun(cf) => {
+            if let Some(sig) = fn_sigs.get(&cf.name.name).cloned() {
+                fn_sigs.insert(format!("{ns}::{}", cf.name.name), sig);
+            }
+        }
+        ItemKind::Cstruct(cs) => {
+            if let Some(s) = struct_defs.get(&cs.name.name).cloned() {
+                struct_defs.insert(format!("{ns}::{}", cs.name.name), s);
+            }
+        }
+        ItemKind::Cvar(cv) => {
+            if let Some(v) = global_vars.get(&cv.name.name).cloned() {
+                out_vars.insert(format!("{ns}::{}", cv.name.name), v);
+            }
+        }
+        ItemKind::TypeAlias(ta) => {
+            if let Some(s) = struct_defs.get(&ta.target.to_string()).cloned() {
+                struct_defs.insert(ta.name.name.clone(), s.clone());
+                struct_defs.insert(format!("{ns}::{}", ta.name.name), s);
+            }
+        }
         _ => {}
     }
 }
@@ -498,8 +699,10 @@ fn get_item_name(item: &Item) -> Option<&str> {
     match &item.kind {
         ItemKind::Fun(f) => Some(&f.name.name),
         ItemKind::Cfun(cf) => Some(&cf.name.name),
+        ItemKind::Cvar(cv) => Some(&cv.name.name),
         ItemKind::Class(c) => Some(&c.name.name),
         ItemKind::Struct(s) => Some(&s.name.name),
+        ItemKind::Cstruct(cs) => Some(&cs.name.name),
         ItemKind::Static(s) => Some(&s.name.name),
         _ => None,
     }
@@ -819,6 +1022,23 @@ fn check_block_stmts(
                             data: None,
                         });
                     }
+                } else if let LValue::Field(ref obj, ref field) = target {
+                    if let Some(obj_ty) = infer_expr_type(obj, local_vars, global_vars, fn_sigs, struct_defs, class_defs, class_context) {
+                        if is_class_field_static(&obj_ty, &field.name, class_defs) {
+                            let range = doc.span_to_range(stmt.span.start, stmt.span.end);
+                            diags.push(LspDiagnostic {
+                                range,
+                                severity: Some(LspSeverity::ERROR),
+                                code: Some(NumberOrString::String("E0503".to_string())),
+                                code_description: None,
+                                source: Some("yukino".to_string()),
+                                message: format!("cannot reassign static field '{}'", field.name),
+                                related_information: None,
+                                tags: None,
+                                data: None,
+                            });
+                        }
+                    }
                 }
                 let target_ty = resolve_lvalue_type(target, local_vars, global_vars, class_defs, class_context);
                 if let Some(ref expected_str) = target_ty {
@@ -1044,10 +1264,20 @@ fn check_expr(
 ) {
     match &expr.kind {
         ExprKind::Call(callee, args) => {
-            if let ExprKind::Ident(ref id) = callee.kind {
-                if let Some(sig) = fn_sigs.get(&id.name) {
-                    validate_call_args(&id.name, sig, args, expr.span, local_vars, global_vars, fn_sigs, struct_defs, class_defs, class_context, doc, diags);
+            match &callee.kind {
+                ExprKind::Ident(id) => {
+                    if let Some(sig) = fn_sigs.get(&id.name) {
+                        validate_call_args(&id.name, sig, args, expr.span, local_vars, global_vars, fn_sigs, struct_defs, class_defs, class_context, doc, diags);
+                    }
                 }
+                ExprKind::Path(segments) if !segments.is_empty() => {
+                    let qualified = segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("::");
+                    let short = &segments.last().unwrap().name;
+                    if let Some(sig) = fn_sigs.get(&qualified).or_else(|| fn_sigs.get(short)) {
+                        validate_call_args(&qualified, sig, args, expr.span, local_vars, global_vars, fn_sigs, struct_defs, class_defs, class_context, doc, diags);
+                    }
+                }
+                _ => {}
             }
             check_expr(callee, local_vars, global_vars, fn_sigs, struct_defs, class_defs, class_context, doc, diags);
             for a in args {
@@ -1453,6 +1683,24 @@ fn validate_struct_init(
         }
     }
 
+    if s_def.is_union {
+        if fields.len() > 1 {
+            let range = doc.span_to_range(name.span.start, name.span.end);
+            diags.push(LspDiagnostic {
+                range,
+                severity: Some(LspSeverity::ERROR),
+                code: Some(NumberOrString::String("E0401".to_string())),
+                code_description: None,
+                source: Some("yukino".to_string()),
+                message: format!("C union '{}' can be initialized with at most 1 field, found {}", name.name, fields.len()),
+                related_information: None,
+                tags: None,
+                data: None,
+            });
+        }
+        return;
+    }
+
     for req in &s_def.fields {
         if !req.has_default && !seen_fields.contains(&req.name) {
             let range = doc.span_to_range(name.span.start, name.span.end);
@@ -1537,7 +1785,30 @@ pub fn infer_expr_type(
                 None
             }
         }
+        ExprKind::Path(ref segments) if !segments.is_empty() => {
+            let qualified = segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("::");
+            let last_name = &segments.last().unwrap().name;
+            if let Some(v) = global_vars.get(&qualified).or_else(|| global_vars.get(last_name)) {
+                let ty = if let Some(inner) = v.ty.strip_prefix("ref ~").or_else(|| v.ty.strip_prefix("ref ")) {
+                    inner.trim().to_string()
+                } else {
+                    v.ty.clone()
+                };
+                Some(ty)
+            } else if struct_defs.contains_key(&qualified) {
+                Some(qualified)
+            } else if struct_defs.contains_key(last_name) {
+                Some(last_name.clone())
+            } else if class_defs.contains_key(last_name) {
+                Some(last_name.clone())
+            } else {
+                None
+            }
+        }
         ExprKind::This => class_context.map(|s| s.to_string()),
+        ExprKind::Super => class_context.and_then(|s| {
+            class_defs.get(s).and_then(|c| c.base_class.clone())
+        }),
         ExprKind::FieldAccess(ref obj, ref field) => {
             let obj_ty = infer_expr_type(obj, local_vars, global_vars, fn_sigs, struct_defs, class_defs, class_context)?;
             if let Some(c_info) = class_defs.get(&obj_ty) {
@@ -1664,6 +1935,14 @@ pub fn infer_expr_type(
                     }
                     return sig.return_type.clone();
                 }
+            } else if let ExprKind::Path(ref segments) = callee.kind {
+                if !segments.is_empty() {
+                    let qualified = segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("::");
+                    let short = &segments.last().unwrap().name;
+                    if let Some(sig) = fn_sigs.get(&qualified).or_else(|| fn_sigs.get(short)) {
+                        return sig.return_type.clone();
+                    }
+                }
             }
             None
         }
@@ -1764,8 +2043,20 @@ pub fn is_type_compatible(expected: &str, actual: &str) -> bool {
             return true;
         }
     }
-    let is_int = |t: &str| matches!(t, "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64");
+    let is_int = |t: &str| matches!(
+        t,
+        "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64"
+            | "c_char" | "c_schar" | "c_uchar" | "c_short" | "c_ushort"
+            | "c_int" | "c_uint" | "c_long" | "c_ulong" | "c_longlong" | "c_ulonglong"
+            | "c_size_t" | "c_ssize_t" | "usize" | "isize"
+    );
     if is_int(exp) && is_int(act) {
+        return true;
+    }
+    if (exp == "bool" || exp == "c_bool") && (act == "bool" || act == "c_bool") {
+        return true;
+    }
+    if exp.starts_with("cfun(") && act.starts_with("cfun(") {
         return true;
     }
     let is_float = |t: &str| matches!(t, "float32" | "float64");
@@ -1895,6 +2186,42 @@ fn has_unknown_base(cls_name: &str, class_defs: &HashMap<String, ClassInfo>) -> 
             return true;
         }
         current = Some(base);
+    }
+    false
+}
+
+fn is_literal_expr(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Literal(_) => true,
+        ExprKind::Unary(UnaryOp::Neg | UnaryOp::Not | UnaryOp::BitNot, inner) => {
+            is_literal_expr(inner)
+        }
+        _ => false,
+    }
+}
+
+fn is_class_field_static(
+    cls_name: &str,
+    field_name: &str,
+    class_defs: &HashMap<String, ClassInfo>,
+) -> bool {
+    let mut current = Some(cls_name);
+    let mut depth = 0;
+    while let Some(name) = current {
+        if depth > 10 {
+            break;
+        }
+        depth += 1;
+        let Some(cls) = class_defs.get(name) else {
+            break;
+        };
+        if cls.static_fields.contains(field_name) {
+            return true;
+        }
+        if cls.fields.contains_key(field_name) {
+            return false;
+        }
+        current = cls.base_class.as_deref();
     }
     false
 }
